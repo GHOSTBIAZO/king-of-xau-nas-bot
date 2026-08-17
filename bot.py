@@ -328,4 +328,4 @@ def analyze_gold():
     )
 
     if None in [ema20, ema50, rsi, atr]:
-        return None, "Unable
+        return None, "Unable to connect to Twelve Data."
