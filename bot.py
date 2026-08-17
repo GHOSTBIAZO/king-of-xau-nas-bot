@@ -1,12 +1,14 @@
 import os
 import logging
-import requests
 from threading import Thread
+
+import requests
 from flask import Flask
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -16,8 +18,12 @@ from telegram.ext import (
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+PORT = int(os.getenv("PORT", "10000"))
 
-PORT = int(os.getenv("PORT", 10000))
+XAU_SYMBOL = "XAU/USD"
+
+INTERVAL = "15min"
+OUTPUT_SIZE = 100
 
 # =========================
 # LOGGING
@@ -31,195 +37,295 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========================
-# FLASK SERVER
+# WEB SERVER
 # =========================
 
-app = Flask(__name__)
+web_app = Flask(__name__)
 
 
-@app.route("/")
+@web_app.route("/")
 def home():
-    return "King of XAU_NAS Bot is running!"
+    return "King of XAU_NAS Gold Bot is running!"
+
+
+@web_app.route("/health")
+def health():
+    return "OK"
 
 
 def run_web_server():
-    app.run(host="0.0.0.0", port=PORT)
+    web_app.run(
+        host="0.0.0.0",
+        port=PORT
+    )
 
 
 # =========================
-# TWELVE DATA
+# TWELVE DATA API
 # =========================
 
-def get_price(symbol):
+def twelve_data_request(endpoint, params):
+
     if not TWELVE_DATA_API_KEY:
         return None, "Twelve Data API key is missing."
 
-    url = "https://api.twelvedata.com/price"
+    params["apikey"] = TWELVE_DATA_API_KEY
 
-    params = {
-        "symbol": symbol,
-        "apikey": TWELVE_DATA_API_KEY,
-    }
+    url = f"https://api.twelvedata.com/{endpoint}"
 
     try:
-        response = requests.get(url, params=params, timeout=15)
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15
+        )
+
         data = response.json()
 
-        if "price" in data:
-            return float(data["price"]), None
+        if data.get("status") == "error":
+            return None, data.get(
+                "message",
+                "Twelve Data returned an error."
+            )
 
-        return None, data.get("message", "Unable to get market price.")
+        return data, None
 
-    except Exception as e:
-        logger.error("Twelve Data error: %s", e)
-        return None, "Could not connect to Twelve Data."
+    except Exception as error:
+
+        logger.error(
+            "API error: %s",
+            error
+        )
+
+        return None, "Unable to connect to Twelve Data."
 
 
 # =========================
-# TELEGRAM COMMANDS
+# LIVE PRICE
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "👑 KING OF XAU_NAS 👑\n\n"
-        "Welcome!\n\n"
-        "📊 Market scanner bot\n\n"
-        "Commands:\n"
-        "/gold - XAU/USD price\n"
-        "/nasdaq - Nasdaq price\n"
-        "/market - Check both markets\n"
-        "/help - Show commands\n\n"
-        "⚠️ Market information is for analysis only."
+def get_price():
+
+    data, error = twelve_data_request(
+        "price",
+        {
+            "symbol": XAU_SYMBOL
+        }
     )
-
-    await update.message.reply_text(message)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "📚 COMMANDS\n\n"
-        "/start - Start the bot\n"
-        "/gold - Check XAU/USD\n"
-        "/nasdaq - Check Nasdaq\n"
-        "/market - Check both\n"
-    )
-
-    await update.message.reply_text(message)
-
-
-async def gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    price, error = get_price("XAU/USD")
 
     if error:
-        await update.message.reply_text(
-            f"❌ Gold data error:\n{error}"
-        )
-        return
+        return None, error
 
-    message = (
-        "🥇 XAU/USD GOLD\n\n"
-        f"💰 Current price: ${price:,.2f}\n\n"
-        "📊 Market data received from Twelve Data.\n"
-        "⚠️ This is not financial advice."
+    try:
+
+        return float(data["price"]), None
+
+    except Exception:
+
+        return None, "No valid price returned."
+
+
+# =========================
+# GET GOLD CANDLES
+# =========================
+
+def get_candles():
+
+    data, error = twelve_data_request(
+        "time_series",
+        {
+            "symbol": XAU_SYMBOL,
+            "interval": INTERVAL,
+            "outputsize": OUTPUT_SIZE,
+            "format": "JSON"
+        }
     )
-
-    await update.message.reply_text(message)
-
-
-async def nasdaq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    price, error = get_price("IXIC")
 
     if error:
-        await update.message.reply_text(
-            f"❌ Nasdaq data error:\n{error}"
+        return None, error
+
+    try:
+
+        values = data.get("values")
+
+        if not values:
+            return None, "No candle data returned."
+
+        candles = []
+
+        for candle in reversed(values):
+
+            candles.append({
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+            })
+
+        return candles, None
+
+    except Exception as error:
+
+        logger.error(
+            "Candle error: %s",
+            error
         )
-        return
 
-    message = (
-        "📈 NASDAQ\n\n"
-        f"💰 Current price: {price:,.2f}\n\n"
-        "📊 Market data received from Twelve Data.\n"
-        "⚠️ This is not financial advice."
-    )
-
-    await update.message.reply_text(message)
-
-
-async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gold_price, gold_error = get_price("XAU/USD")
-    nasdaq_price, nasdaq_error = get_price("IXIC")
-
-    message = "👑 KING OF XAU_NAS MARKET SCANNER 👑\n\n"
-
-    if gold_price is not None:
-        message += f"🥇 XAU/USD: ${gold_price:,.2f}\n"
-    else:
-        message += f"🥇 XAU/USD: ❌ {gold_error}\n"
-
-    if nasdaq_price is not None:
-        message += f"📈 NASDAQ: {nasdaq_price:,.2f}\n"
-    else:
-        message += f"📈 NASDAQ: ❌ {nasdaq_error}\n"
-
-    message += (
-        "\n📊 Live market data\n"
-        "⚠️ Analysis only — not financial advice."
-    )
-
-    await update.message.reply_text(message)
+        return None, "Unable to process candle data."
 
 
 # =========================
-# MAIN
+# EMA
 # =========================
 
-def main():
+def calculate_ema(values, period):
 
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN is missing.")
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
+    if len(values) < period:
+        return None
 
-    if not TWELVE_DATA_API_KEY:
-        logger.warning("TWELVE_DATA_API_KEY is missing.")
+    multiplier = 2 / (period + 1)
 
-    # Start Flask server
-    web_thread = Thread(target=run_web_server)
-    web_thread.daemon = True
-    web_thread.start()
+    ema = sum(values[:period]) / period
 
-    # Create Telegram application
-    application = Application.builder().token(
-        TELEGRAM_BOT_TOKEN
-    ).build()
+    for price in values[period:]:
 
-    # Commands
-    application.add_handler(
-        CommandHandler("start", start)
+        ema = (
+            (price - ema) * multiplier
+        ) + ema
+
+    return ema
+
+
+# =========================
+# RSI
+# =========================
+
+def calculate_rsi(values, period=14):
+
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+
+        change = values[i] - values[i - 1]
+
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+
+    average_gain = sum(
+        gains[:period]
+    ) / period
+
+    average_loss = sum(
+        losses[:period]
+    ) / period
+
+    for i in range(period, len(gains)):
+
+        average_gain = (
+            (average_gain * (period - 1))
+            + gains[i]
+        ) / period
+
+        average_loss = (
+            (average_loss * (period - 1))
+            + losses[i]
+        ) / period
+
+    if average_loss == 0:
+        return 100.0
+
+    rs = average_gain / average_loss
+
+    return 100 - (100 / (1 + rs))
+
+
+# =========================
+# ATR
+# =========================
+
+def calculate_atr(candles, period=14):
+
+    if len(candles) < period + 1:
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        previous_close = candles[i - 1]["close"]
+
+        true_range = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close)
+        )
+
+        true_ranges.append(true_range)
+
+    atr = sum(
+        true_ranges[:period]
+    ) / period
+
+    for value in true_ranges[period:]:
+
+        atr = (
+            (atr * (period - 1)) + value
+        ) / period
+
+    return atr
+
+
+# =========================
+# GOLD ANALYSIS
+# =========================
+
+def analyze_gold():
+
+    candles, error = get_candles()
+
+    if error:
+        return None, error
+
+    if len(candles) < 50:
+        return None, "Not enough candle data."
+
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
+
+    price = closes[-1]
+
+    ema20 = calculate_ema(
+        closes,
+        20
     )
 
-    application.add_handler(
-        CommandHandler("help", help_command)
+    ema50 = calculate_ema(
+        closes,
+        50
     )
 
-    application.add_handler(
-        CommandHandler("gold", gold)
+    rsi = calculate_rsi(
+        closes,
+        14
     )
 
-    application.add_handler(
-        CommandHandler("nasdaq", nasdaq)
+    atr = calculate_atr(
+        candles,
+        14
     )
 
-    application.add_handler(
-        CommandHandler("market", market)
-    )
-
-    logger.info("King of XAU_NAS bot is starting...")
-
-    # Start Telegram polling
-    application.run_polling(
-        drop_pending_updates=True
-    )
-
-
-if __name__ == "__main__":
-    main()
+    if None in [ema20, ema50, rsi, atr]:
+        return None, "Unable
