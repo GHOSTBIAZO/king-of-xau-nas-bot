@@ -1,7 +1,9 @@
 import os
+import json
+import time
 import asyncio
 import logging
-import threading
+from threading import Thread, Lock
 from datetime import datetime, timezone
 
 import requests
@@ -13,9 +15,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
-
 # ============================================================
-# 👑 KING OF XAU_NAS — INSTITUTIONAL GOLD TELEGRAM AI
+# 👑 KING OF XAU_NAS — GOLD
+# AUTOMATIC TELEGRAM GOLD SCANNER
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS — GOLD"
@@ -24,63 +26,51 @@ BOT_NAME = "👑 KING OF XAU_NAS — GOLD"
 # ENVIRONMENT VARIABLES
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-# Optional:
-# Put your Telegram chat ID in Render if you want the bot
-# to automatically send signals to one specific chat.
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
-
 # ============================================================
-# MARKET SETTINGS
+# GOLD SETTINGS
 # ============================================================
 
 XAU_SYMBOL = "XAU/USD"
 
 INTERVAL = "15min"
-OUTPUT_SIZE = 120
+OUTPUT_SIZE = 100
 
-SCAN_SECONDS = 60
-
-# Signal quality
-MIN_CONFIDENCE = 70
-
-# ATR multipliers
-SL_ATR_MULTIPLIER = 1.5
-
-TP1_ATR_MULTIPLIER = 1.5
-TP2_ATR_MULTIPLIER = 2.5
-TP3_ATR_MULTIPLIER = 4.0
-
+SCAN_INTERVAL_SECONDS = 600  # 10 minutes
 
 # ============================================================
-# GLOBAL STATE
+# FILES
 # ============================================================
 
-last_signal_key = None
-
-active_trade = None
-
-bot_application = None
-
-stop_event = threading.Event()
-
+CHAT_ID_FILE = "telegram_chat_id.json"
 
 # ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
 logger = logging.getLogger(BOT_NAME)
 
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+telegram_application = None
+
+chat_id_lock = Lock()
+
+last_signal_key = None
+last_signal_time = 0
+
+scanner_running = False
 
 # ============================================================
 # FLASK SERVER
@@ -91,7 +81,20 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "KING OF XAU_NAS — GOLD BOT ONLINE 👑", 200
+    return f"""
+    <html>
+        <head>
+            <title>{BOT_NAME}</title>
+        </head>
+        <body style="background:#111;color:white;font-family:Arial;text-align:center;padding-top:50px;">
+            <h1>{BOT_NAME}</h1>
+            <h2>🟢 BOT ONLINE</h2>
+            <p>Market: XAU/USD</p>
+            <p>Timeframe: 15 Minutes</p>
+            <p>Scanner: Automatic</p>
+        </body>
+    </html>
+    """
 
 
 @app.route("/health")
@@ -99,47 +102,118 @@ def health():
     return {
         "status": "online",
         "bot": BOT_NAME,
-        "symbol": XAU_SYMBOL,
+        "market": "XAU/USD",
         "timeframe": INTERVAL,
-    }, 200
+        "scanner": scanner_running,
+    }
 
 
 def run_flask():
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False,
-        use_reloader=False,
-    )
+    try:
+        app.run(
+            host="0.0.0.0",
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+        )
+    except Exception as e:
+        logger.error(f"Flask error: {e}")
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# CHAT ID STORAGE
 # ============================================================
 
-async def send_chat_message(
-    context,
-    message,
-    chat_id=None,
-):
+def load_chat_id():
     """
-    Send Telegram message.
-
-    If chat_id is supplied, send there.
-    Otherwise use TELEGRAM_CHAT_ID.
+    Loads the saved Telegram Chat ID.
     """
 
-    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+    try:
+        if not os.path.exists(CHAT_ID_FILE):
+            return None
 
-    if not target_chat_id:
+        with open(CHAT_ID_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        chat_id = data.get("chat_id")
+
+        if chat_id:
+            return str(chat_id)
+
+    except Exception as e:
+        logger.error(f"Could not load Chat ID: {e}")
+
+    return None
+
+
+def save_chat_id(chat_id):
+    """
+    Saves the Telegram Chat ID locally.
+    """
+
+    try:
+        with chat_id_lock:
+
+            with open(
+                CHAT_ID_FILE,
+                "w",
+                encoding="utf-8",
+            ) as file:
+
+                json.dump(
+                    {
+                        "chat_id": str(chat_id),
+                        "saved_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                    },
+                    file,
+                    indent=4,
+                )
+
+        logger.info(
+            f"Telegram Chat ID saved automatically: {chat_id}"
+        )
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Could not save Chat ID: {e}")
+        return False
+
+
+# ============================================================
+# TELEGRAM SEND MESSAGE
+# ============================================================
+
+async def send_message(message):
+    """
+    Sends a Telegram message to the automatically
+    detected Chat ID.
+    """
+
+    global telegram_application
+
+    chat_id = load_chat_id()
+
+    if not chat_id:
         logger.warning(
-            "No TELEGRAM_CHAT_ID configured."
+            "No TELEGRAM_CHAT_ID configured. "
+            "Send /start to the bot first."
+        )
+        return False
+
+    if telegram_application is None:
+        logger.warning(
+            "Telegram application is not ready."
         )
         return False
 
     try:
-        await context.bot.send_message(
-            chat_id=target_chat_id,
+
+        await telegram_application.bot.send_message(
+            chat_id=chat_id,
             text=message,
             parse_mode="Markdown",
         )
@@ -147,12 +221,121 @@ async def send_chat_message(
         return True
 
     except Exception as e:
+
         logger.error(
-            "Telegram send error: %s",
-            e,
+            f"Telegram send error: {e}"
         )
 
         return False
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+
+    username = ""
+
+    if update.effective_user:
+
+        if update.effective_user.username:
+            username = (
+                f"@{update.effective_user.username}"
+            )
+
+    # Automatically save Chat ID
+    saved = save_chat_id(chat_id)
+
+    if saved:
+
+        message = (
+            "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+            "🟢 *BOT CONNECTED*\n\n"
+            f"👤 User: {username or 'Telegram User'}\n"
+            f"🆔 Chat ID: `{chat_id}`\n\n"
+            "✅ Your Telegram Chat ID has been "
+            "automatically detected and saved.\n\n"
+            "🟡 Market: XAU/USD\n"
+            "⏱ Timeframe: 15 Minutes\n"
+            "🤖 Automatic Scanner: ON\n\n"
+            "Use /scan to request a live GOLD scan.\n"
+            "Use /status to check the bot."
+        )
+
+    else:
+
+        message = (
+            "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+            "⚠️ I detected your Chat ID but could "
+            "not save it.\n\n"
+            f"🆔 Chat ID: `{chat_id}`"
+        )
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# /STATUS
+# ============================================================
+
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat_id = load_chat_id()
+
+    if chat_id:
+        chat_status = "🟢 CONNECTED"
+    else:
+        chat_status = "🔴 NOT CONNECTED"
+
+    message = (
+        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 *BOT STATUS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Telegram: {chat_status}\n"
+        f"Market: 🟡 XAU/USD\n"
+        f"Timeframe: {INTERVAL}\n"
+        f"Scanner: {'🟢 ON' if scanner_running else '🔴 OFF'}\n"
+        f"Twelve Data: "
+        f"{'🟢 CONNECTED' if TWELVE_DATA_API_KEY else '🔴 MISSING'}\n\n"
+    )
+
+    if chat_id:
+        message += (
+            f"🆔 Saved Chat ID: `{chat_id}`\n\n"
+        )
+    else:
+        message += (
+            "Send /start to automatically register "
+            "your Telegram Chat ID.\n\n"
+        )
+
+    message += (
+        "Commands:\n"
+        "/start — Register Telegram\n"
+        "/scan — Scan GOLD now\n"
+        "/status — Bot status"
+    )
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+    )
 
 
 # ============================================================
@@ -160,14 +343,13 @@ async def send_chat_message(
 # ============================================================
 
 def get_gold_data():
-    """
-    Download XAU/USD candles from Twelve Data.
-    """
 
     if not TWELVE_DATA_API_KEY:
+
         logger.error(
             "TWELVE_DATA_API_KEY is missing."
         )
+
         return None
 
     url = "https://api.twelvedata.com/time_series"
@@ -185,74 +367,65 @@ def get_gold_data():
         response = requests.get(
             url,
             params=params,
-            timeout=20,
+            timeout=30,
         )
 
-        response.raise_for_status()
+        if response.status_code != 200:
+
+            logger.error(
+                f"Twelve Data HTTP error: "
+                f"{response.status_code}"
+            )
+
+            return None
 
         data = response.json()
 
-        if "status" in data:
-            if data["status"] == "error":
-                logger.error(
-                    "Twelve Data error: %s",
-                    data.get("message"),
-                )
-                return None
+        if "values" not in data:
 
-        values = data.get("values")
-
-        if not values:
             logger.error(
-                "No XAU/USD data returned."
+                f"Twelve Data error: {data}"
             )
+
             return None
 
-        # Twelve Data returns newest first.
+        values = data["values"]
+
+        if len(values) < 50:
+
+            logger.error(
+                "Not enough GOLD candles."
+            )
+
+            return None
+
         values = list(reversed(values))
 
         candles = []
 
-        for candle in values:
+        for item in values:
 
             try:
 
                 candles.append(
                     {
-                        "datetime": candle["datetime"],
-                        "open": float(candle["open"]),
-                        "high": float(candle["high"]),
-                        "low": float(candle["low"]),
-                        "close": float(candle["close"]),
+                        "datetime": item["datetime"],
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
                     }
                 )
 
-            except (KeyError, ValueError, TypeError):
+            except Exception:
                 continue
-
-        if len(candles) < 60:
-            logger.warning(
-                "Not enough candles: %s",
-                len(candles),
-            )
-            return None
 
         return candles
 
-    except requests.RequestException as e:
-
-        logger.error(
-            "Market data request failed: %s",
-            e,
-        )
-
-        return None
-
     except Exception as e:
 
-        logger.exception(
-            "Unexpected market data error: %s",
-            e,
+        logger.error(
+            f"Gold data error: {e}"
         )
 
         return None
@@ -286,7 +459,7 @@ def calculate_ema(values, period):
 
 def calculate_rsi(values, period=14):
 
-    if len(values) <= period:
+    if len(values) < period + 1:
         return None
 
     gains = []
@@ -297,40 +470,39 @@ def calculate_rsi(values, period=14):
         change = values[i] - values[i - 1]
 
         if change > 0:
+
             gains.append(change)
             losses.append(0)
 
         else:
+
             gains.append(0)
             losses.append(abs(change))
 
-    average_gain = sum(
+    avg_gain = sum(
         gains[:period]
     ) / period
 
-    average_loss = sum(
+    avg_loss = sum(
         losses[:period]
     ) / period
 
-    for i in range(
-        period,
-        len(gains),
-    ):
+    for i in range(period, len(gains)):
 
-        average_gain = (
-            (average_gain * (period - 1))
+        avg_gain = (
+            (avg_gain * (period - 1))
             + gains[i]
         ) / period
 
-        average_loss = (
-            (average_loss * (period - 1))
+        avg_loss = (
+            (avg_loss * (period - 1))
             + losses[i]
         ) / period
 
-    if average_loss == 0:
+    if avg_loss == 0:
         return 100.0
 
-    rs = average_gain / average_loss
+    rs = avg_gain / avg_loss
 
     return 100 - (
         100 / (1 + rs)
@@ -343,7 +515,7 @@ def calculate_rsi(values, period=14):
 
 def calculate_atr(candles, period=14):
 
-    if len(candles) <= period:
+    if len(candles) < period + 1:
         return None
 
     true_ranges = []
@@ -383,43 +555,23 @@ def calculate_atr(candles, period=14):
 
 
 # ============================================================
-# MARKET STRUCTURE
+# MARKET ANALYSIS
 # ============================================================
 
-def market_structure(candles):
+def analyze_gold(candles):
 
-    if len(candles) < 10:
-        return "NEUTRAL"
-
-    recent = candles[-10:]
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
 
     highs = [
         candle["high"]
-        for candle in recent
+        for candle in candles
     ]
 
     lows = [
         candle["low"]
-        for candle in recent
-    ]
-
-    if highs[-1] > highs[-3] and lows[-1] > lows[-3]:
-        return "BULLISH"
-
-    if highs[-1] < highs[-3] and lows[-1] < lows[-3]:
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
-def generate_signal(candles):
-
-    closes = [
-        candle["close"]
         for candle in candles
     ]
 
@@ -445,208 +597,184 @@ def generate_signal(candles):
         14,
     )
 
-    structure = market_structure(
-        candles
-    )
-
-    if (
-        ema20 is None
-        or ema50 is None
-        or rsi is None
-        or atr is None
+    if None in (
+        ema20,
+        ema50,
+        rsi,
+        atr,
     ):
         return None
 
-    bullish_points = 0
-    bearish_points = 0
+    recent_high = max(
+        highs[-20:]
+    )
+
+    recent_low = min(
+        lows[-20:]
+    )
 
     # ========================================================
-    # EMA TREND
+    # TREND
     # ========================================================
 
-    if ema20 > ema50:
-        bullish_points += 30
+    if (
+        price > ema20
+        and ema20 > ema50
+    ):
 
-    elif ema20 < ema50:
-        bearish_points += 30
+        trend = "BULLISH 📈"
 
-    # ========================================================
-    # PRICE VS EMA
-    # ========================================================
+    elif (
+        price < ema20
+        and ema20 < ema50
+    ):
 
-    if price > ema20:
-        bullish_points += 20
-
-    elif price < ema20:
-        bearish_points += 20
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
-    if 50 <= rsi <= 70:
-        bullish_points += 20
-
-    elif 30 <= rsi < 50:
-        bearish_points += 20
-
-    elif rsi > 70:
-        bullish_points += 10
-
-    elif rsi < 30:
-        bearish_points += 10
-
-    # ========================================================
-    # MARKET STRUCTURE
-    # ========================================================
-
-    if structure == "BULLISH":
-        bullish_points += 30
-
-    elif structure == "BEARISH":
-        bearish_points += 30
-
-    # ========================================================
-    # DETERMINE SIGNAL
-    # ========================================================
-
-    if bullish_points > bearish_points:
-
-        side = "BUY"
-
-        confidence = bullish_points
-
-    elif bearish_points > bullish_points:
-
-        side = "SELL"
-
-        confidence = bearish_points
+        trend = "BEARISH 📉"
 
     else:
 
-        return {
-            "signal": "WAIT",
-            "confidence": 50,
-            "price": price,
-            "ema20": ema20,
-            "ema50": ema50,
-            "rsi": rsi,
-            "atr": atr,
-            "structure": structure,
-        }
+        trend = "RANGING ↔️"
 
     # ========================================================
-    # FILTER WEAK SIGNALS
+    # SIGNAL
     # ========================================================
 
-    if confidence < MIN_CONFIDENCE:
+    buy_score = 0
+    sell_score = 0
 
-        return {
-            "signal": "WAIT",
-            "confidence": confidence,
-            "price": price,
-            "ema20": ema20,
-            "ema50": ema50,
-            "rsi": rsi,
-            "atr": atr,
-            "structure": structure,
-        }
+    # EMA structure
+    if price > ema20:
+        buy_score += 25
+
+    if price > ema50:
+        buy_score += 20
+
+    if price < ema20:
+        sell_score += 25
+
+    if price < ema50:
+        sell_score += 20
+
+    # RSI
+    if 50 <= rsi <= 68:
+        buy_score += 20
+
+    if 32 <= rsi <= 50:
+        sell_score += 20
+
+    # Momentum
+    if len(closes) >= 4:
+
+        if closes[-1] > closes[-2]:
+            buy_score += 15
+
+        if closes[-1] < closes[-2]:
+            sell_score += 15
+
+    # Structure
+    if price > recent_high * 0.999:
+
+        buy_score += 20
+
+    if price < recent_low * 1.001:
+
+        sell_score += 20
+
+    # ========================================================
+    # FINAL SIGNAL
+    # ========================================================
+
+    if buy_score >= sell_score:
+
+        side = "BUY 🟢"
+        score = buy_score
+
+    else:
+
+        side = "SELL 🔴"
+        score = sell_score
+
+    confidence = min(
+        max(score, 50),
+        95,
+    )
 
     # ========================================================
     # TRADE LEVELS
     # ========================================================
 
-    if side == "BUY":
+    if side.startswith("BUY"):
 
         entry = price
 
-        sl = (
-            entry
-            - (
-                atr
-                * SL_ATR_MULTIPLIER
-            )
+        stop_loss = (
+            price - atr * 1.5
         )
 
         tp1 = (
-            entry
-            + (
-                atr
-                * TP1_ATR_MULTIPLIER
-            )
+            price + atr * 1.0
         )
 
         tp2 = (
-            entry
-            + (
-                atr
-                * TP2_ATR_MULTIPLIER
-            )
+            price + atr * 2.0
         )
 
         tp3 = (
-            entry
-            + (
-                atr
-                * TP3_ATR_MULTIPLIER
-            )
+            price + atr * 3.0
         )
 
-        pending_type = "BUY STOP / MARKET BUY"
+        # Pullback pending order
+        pending_entry = (
+            price - atr * 0.50
+        )
+
+        pending_type = "BUY LIMIT"
 
     else:
 
         entry = price
 
-        sl = (
-            entry
-            + (
-                atr
-                * SL_ATR_MULTIPLIER
-            )
+        stop_loss = (
+            price + atr * 1.5
         )
 
         tp1 = (
-            entry
-            - (
-                atr
-                * TP1_ATR_MULTIPLIER
-            )
+            price - atr * 1.0
         )
 
         tp2 = (
-            entry
-            - (
-                atr
-                * TP2_ATR_MULTIPLIER
-            )
+            price - atr * 2.0
         )
 
         tp3 = (
-            entry
-            - (
-                atr
-                * TP3_ATR_MULTIPLIER
-            )
+            price - atr * 3.0
         )
 
-        pending_type = "SELL STOP / MARKET SELL"
+        # Pullback pending order
+        pending_entry = (
+            price + atr * 0.50
+        )
+
+        pending_type = "SELL LIMIT"
 
     return {
-        "signal": side,
-        "confidence": confidence,
         "price": price,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
         "ema20": ema20,
         "ema50": ema50,
         "rsi": rsi,
         "atr": atr,
-        "structure": structure,
-        "order_type": pending_type,
+        "trend": trend,
+        "side": side,
+        "confidence": confidence,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "pending_type": pending_type,
+        "pending_entry": pending_entry,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
     }
 
 
@@ -654,562 +782,88 @@ def generate_signal(candles):
 # FORMAT SIGNAL
 # ============================================================
 
-def format_signal(signal):
+def format_signal(analysis):
 
-    side = signal["signal"]
+    side = analysis["side"]
 
-    if side == "BUY":
-        emoji = "🟢"
-    else:
-        emoji = "🔴"
-
-    now = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
+    price = analysis["price"]
 
     message = (
         "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
-
         "🟡 *XAU/USD*\n"
-        f"{emoji} *SIGNAL: {side}*\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🧠 *AI MARKET ANALYSIS*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"📊 Structure: "
-        f"*{signal['structure']}*\n"
-
-        f"🎯 Confidence: "
-        f"*{signal['confidence']}%*\n\n"
-
-        f"💰 Entry: "
-        f"`${signal['entry']:,.2f}`\n"
-
-        f"🛑 Stop Loss: "
-        f"`${signal['sl']:,.2f}`\n\n"
-
-        f"🎯 TP1: "
-        f"`${signal['tp1']:,.2f}`\n"
-
-        f"🎯 TP2: "
-        f"`${signal['tp2']:,.2f}`\n"
-
-        f"🏆 TP3: "
-        f"`${signal['tp3']:,.2f}`\n\n"
-
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📈 *TECHNICAL DATA*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"EMA 20: "
-        f"`{signal['ema20']:,.2f}`\n"
-
-        f"EMA 50: "
-        f"`{signal['ema50']:,.2f}`\n"
-
-        f"RSI 14: "
-        f"`{signal['rsi']:.1f}`\n"
-
-        f"ATR 14: "
-        f"`{signal['atr']:.2f}`\n\n"
-
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🚨 *AI MARKET SIGNAL*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 Signal: *{side}*\n"
+        f"🎯 Confidence: *{analysis['confidence']:.0f}%*\n\n"
+        f"💰 Price: `${price:,.2f}`\n"
+        f"📈 Trend: *{analysis['trend']}*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 *TECHNICAL ANALYSIS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"EMA 20: `{analysis['ema20']:,.2f}`\n"
+        f"EMA 50: `{analysis['ema50']:,.2f}`\n"
+        f"RSI 14: `{analysis['rsi']:.1f}`\n"
+        f"ATR 14: `{analysis['atr']:.2f}`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 *TRADE LEVELS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🟢 Entry: `${analysis['entry']:,.2f}`\n"
+        f"🛑 Stop Loss: `${analysis['stop_loss']:,.2f}`\n"
+        f"🥇 TP1: `${analysis['tp1']:,.2f}`\n"
+        f"🥈 TP2: `${analysis['tp2']:,.2f}`\n"
+        f"🏆 TP3: `${analysis['tp3']:,.2f}`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⏳ *PENDING ORDER IDEA*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{analysis['pending_type']}: "
+        f"`${analysis['pending_entry']:,.2f}`\n\n"
         f"⏱ Timeframe: *{INTERVAL}*\n"
-
-        f"📌 Order Type: "
-        f"*{signal['order_type']}*\n\n"
-
-        f"🕐 {now}\n\n"
-
-        "⚠️ *Market information is for "
-        "analysis only. Not financial advice.*"
+        "📡 Data: *Twelve Data*\n\n"
+        "⚠️ Market information is for analysis only.\n"
+        "Not financial advice. Always manage risk."
     )
 
     return message
 
 
 # ============================================================
-# WAIT MESSAGE
+# SCAN GOLD
 # ============================================================
 
-def format_wait(signal):
+def scan_gold():
 
-    return (
-        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
-        "🟡 *XAU/USD*\n\n"
-        "⏳ *WAIT — NO HIGH QUALITY SETUP*\n\n"
-        f"💰 Price: "
-        f"`${signal['price']:,.2f}`\n\n"
+    logger.info("🔎 Scanning XAU/USD...")
 
-        f"📈 Structure: "
-        f"*{signal['structure']}*\n"
-
-        f"🎯 Confidence: "
-        f"*{signal['confidence']}%*\n\n"
-
-        f"EMA 20: "
-        f"`{signal['ema20']:,.2f}`\n"
-
-        f"EMA 50: "
-        f"`{signal['ema50']:,.2f}`\n"
-
-        f"RSI 14: "
-        f"`{signal['rsi']:.1f}`\n"
-
-        f"ATR 14: "
-        f"`{signal['atr']:.2f}`\n\n"
-
-        "🤖 *AI is monitoring the market.*"
-    )
-
-
-# ============================================================
-# TRADE MONITOR
-# ============================================================
-
-async def monitor_trade(
-    context,
-    price,
-):
-
-    global active_trade
-
-    if not active_trade:
-        return
-
-    trade = active_trade
-
-    side = trade["signal"]
-
-    # ========================================================
-    # BUY
-    # ========================================================
-
-    if side == "BUY":
-
-        if not trade["tp1_hit"] and price >= trade["tp1"]:
-
-            trade["tp1_hit"] = True
-
-            await send_chat_message(
-                context,
-                (
-                    "👑 *TP1 HIT* 🎯\n\n"
-                    "🟡 XAU/USD\n"
-                    "🟢 BUY\n\n"
-                    f"💰 Price: `${price:,.2f}`\n\n"
-                    "🔒 TP1 reached.\n"
-                    "📈 Trade continues toward TP2."
-                ),
-            )
-
-        if not trade["tp2_hit"] and price >= trade["tp2"]:
-
-            trade["tp2_hit"] = True
-
-            await send_chat_message(
-                context,
-                (
-                    "👑 *TP2 HIT* 🎯🎯\n\n"
-                    "🟡 XAU/USD\n"
-                    "🟢 BUY\n\n"
-                    f"💰 Price: `${price:,.2f}`\n\n"
-                    "🏆 TP2 reached.\n"
-                    "🚀 Final target: TP3."
-                ),
-            )
-
-        if not trade["tp3_hit"] and price >= trade["tp3"]:
-
-            trade["tp3_hit"] = True
-
-            await send_chat_message(
-                context,
-                (
-                    "👑 *TP3 HIT — "
-                    "TRADE COMPLETE* 🏆\n\n"
-
-                    "🟡 XAU/USD\n"
-                    "🟢 BUY\n\n"
-
-                    f"💰 Exit: `${price:,.2f}`\n\n"
-
-                    "🏆 *Full target reached.*\n"
-                    "✅ Trade completed."
-                ),
-            )
-
-            active_trade = None
-
-            return
-
-        if price <= trade["sl"]:
-
-            await send_chat_message(
-                context,
-                (
-                    "🛑 *STOP LOSS HIT*\n\n"
-                    "🟡 XAU/USD\n"
-                    "🟢 BUY\n\n"
-
-                    f"💰 Exit: `${price:,.2f}`\n\n"
-
-                    "❌ Trade closed at SL."
-                ),
-            )
-
-            active_trade = None
-
-            return
-
-    # ========================================================
-    # SELL
-    # ========================================================
-
-    elif side == "SELL":
-
-        if not trade["tp1_hit"] and price <= trade["tp1"]:
-
-            trade["tp1_hit"] = True
-
-            await send_chat_message(
-                context,
-                (
-                    "👑 *TP1 HIT* 🎯\n\n"
-                    "🟡 XAU/USD\n"
-                    "🔴 SELL\n\n"
-                    f"💰 Price: `${price:,.2f}`\n\n"
-                    "🔒 TP1 reached.\n"
-                    "📉 Trade continues toward TP2."
-                ),
-            )
-
-        if not trade["tp2_hit"] and price <= trade["tp2"]:
-
-            trade["tp2_hit"] = True
-
-            await send_chat_message(
-                context,
-                (
-                    "👑 *TP2 HIT* 🎯🎯\n\n"
-                    "🟡 XAU/USD\n"
-                    "🔴 SELL\n\n"
-                    f"💰 Price: `${price:,.2f}`\n\n"
-                    "🏆 TP2 reached.\n"
-                    "🚀 Final target: TP3."
-                ),
-            )
-
-        if not trade["tp3_hit"] and price <= trade["tp3"]:
-
-            trade["tp3_hit"] = True
-
-            await send_chat_message(
-                context,
-                (
-                    "👑 *TP3 HIT — "
-                    "TRADE COMPLETE* 🏆\n\n"
-
-                    "🟡 XAU/USD\n"
-                    "🔴 SELL\n\n"
-
-                    f"💰 Exit: `${price:,.2f}`\n\n"
-
-                    "🏆 *Full target reached.*\n"
-                    "✅ Trade completed."
-                ),
-            )
-
-            active_trade = None
-
-            return
-
-        if price >= trade["sl"]:
-
-            await send_chat_message(
-                context,
-                (
-                    "🛑 *STOP LOSS HIT*\n\n"
-                    "🟡 XAU/USD\n"
-                    "🔴 SELL\n\n"
-
-                    f"💰 Exit: `${price:,.2f}`\n\n"
-
-                    "❌ Trade closed at SL."
-                ),
-            )
-
-            active_trade = None
-
-            return
-
-
-# ============================================================
-# MARKET SCANNER
-# ============================================================
-
-async def scan_market(
-    context,
-    force=False,
-):
-
-    global last_signal_key
-    global active_trade
-
-    candles = await asyncio.to_thread(
-        get_gold_data
-    )
+    candles = get_gold_data()
 
     if not candles:
 
-        logger.warning(
-            "Unable to retrieve gold data."
+        logger.error(
+            "Could not retrieve GOLD data."
         )
 
-        return
+        return None
 
-    signal = generate_signal(
+    analysis = analyze_gold(
         candles
     )
 
-    if not signal:
+    if not analysis:
 
-        logger.warning(
-            "Unable to generate signal."
+        logger.error(
+            "Could not analyze GOLD."
         )
 
-        return
-
-    price = signal["price"]
-
-    # ========================================================
-    # MONITOR ACTIVE TRADE
-    # ========================================================
-
-    if active_trade:
-
-        await monitor_trade(
-            context,
-            price,
-        )
-
-    # ========================================================
-    # WAIT
-    # ========================================================
-
-    if signal["signal"] == "WAIT":
-
-        logger.info(
-            "WAIT | Price %.2f | Confidence %s%%",
-            price,
-            signal["confidence"],
-        )
-
-        return
-
-    # ========================================================
-    # UNIQUE SIGNAL KEY
-    # ========================================================
-
-    candle_time = candles[-1]["datetime"]
-
-    signal_key = (
-        f"{candle_time}_"
-        f"{signal['signal']}"
-    )
-
-    # Don't send duplicate signal
-    # for the same candle.
-    if not force and signal_key == last_signal_key:
-
-        logger.info(
-            "Duplicate signal skipped."
-        )
-
-        return
-
-    # ========================================================
-    # REPLACE ACTIVE TRADE
-    # ========================================================
-
-    active_trade = {
-        "signal": signal["signal"],
-        "entry": signal["entry"],
-        "sl": signal["sl"],
-        "tp1": signal["tp1"],
-        "tp2": signal["tp2"],
-        "tp3": signal["tp3"],
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "tp3_hit": False,
-        "created_at": candle_time,
-    }
-
-    last_signal_key = signal_key
-
-    message = format_signal(
-        signal
-    )
-
-    await send_chat_message(
-        context,
-        message,
-    )
+        return None
 
     logger.info(
-        "%s signal sent | Entry %.2f | SL %.2f | TP3 %.2f | Confidence %s%%",
-        signal["signal"],
-        signal["entry"],
-        signal["sl"],
-        signal["tp3"],
-        signal["confidence"],
+        f"GOLD: {analysis['side']} | "
+        f"Price: {analysis['price']:.2f} | "
+        f"Confidence: {analysis['confidence']:.0f}%"
     )
 
-
-# ============================================================
-# BACKGROUND MONITOR
-# ============================================================
-
-async def background_monitor(
-    context,
-):
-
-    logger.info(
-        "Background gold scanner started."
-    )
-
-    while not stop_event.is_set():
-
-        try:
-
-            await scan_market(
-                context
-            )
-
-        except asyncio.CancelledError:
-
-            logger.info(
-                "Background monitor cancelled."
-            )
-
-            break
-
-        except Exception as e:
-
-            logger.exception(
-                "Monitor error: %s",
-                e,
-            )
-
-        try:
-
-            await asyncio.sleep(
-                SCAN_SECONDS
-            )
-
-        except asyncio.CancelledError:
-
-            break
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    chat_id = update.effective_chat.id
-
-    message = (
-        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
-
-        "🟢 *BOT ONLINE*\n\n"
-
-        "🟡 Market: *XAU/USD*\n"
-        f"⏱ Timeframe: *{INTERVAL}*\n"
-        "📡 Data: *Twelve Data*\n"
-        "🤖 Engine: *AI Technical Scanner*\n\n"
-
-        "The bot is monitoring GOLD for "
-        "high-quality BUY and SELL setups.\n\n"
-
-        "Commands:\n"
-        "• /start — Start bot\n"
-        "• /status — Bot status\n"
-        "• /scan — Scan GOLD now\n"
-        "• /trade — Current trade\n\n"
-
-        "⚠️ Analysis only. Not financial advice."
-    )
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=message,
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# /STATUS
-# ============================================================
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    status = (
-        "👑 *KING OF XAU_NAS — GOLD*\n\n"
-        "🟢 *STATUS: ONLINE*\n\n"
-        f"🟡 Symbol: `{XAU_SYMBOL}`\n"
-        f"⏱ Timeframe: `{INTERVAL}`\n"
-        f"🔄 Scanner: Every `{SCAN_SECONDS}` seconds\n"
-        f"🎯 Minimum confidence: `{MIN_CONFIDENCE}%`\n"
-        "📡 Data: `Twelve Data`\n"
-        "📲 Notifications: `Telegram`\n"
-    )
-
-    if active_trade:
-
-        status += (
-            "\n━━━━━━━━━━━━━━━━━━\n"
-            "📊 *ACTIVE SIGNAL*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-
-            f"Direction: "
-            f"*{active_trade['signal']}*\n"
-
-            f"Entry: "
-            f"`${active_trade['entry']:,.2f}`\n"
-
-            f"SL: "
-            f"`${active_trade['sl']:,.2f}`\n"
-
-            f"TP1: "
-            f"`${active_trade['tp1']:,.2f}`\n"
-
-            f"TP2: "
-            f"`${active_trade['tp2']:,.2f}`\n"
-
-            f"TP3: "
-            f"`${active_trade['tp3']:,.2f}`\n"
-        )
-
-    else:
-
-        status += (
-            "\n📭 *No active trade.*"
-        )
-
-    await update.message.reply_text(
-        status,
-        parse_mode="Markdown",
-    )
+    return analysis
 
 
 # ============================================================
@@ -1227,55 +881,21 @@ async def scan_command(
         parse_mode="Markdown",
     )
 
-    await scan_market(
-        context,
-        force=True,
+    analysis = await asyncio.to_thread(
+        scan_gold
     )
 
-
-# ============================================================
-# /TRADE
-# ============================================================
-
-async def trade_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not active_trade:
+    if not analysis:
 
         await update.message.reply_text(
-            "📭 *No active GOLD trade.*",
-            parse_mode="Markdown",
+            "❌ I couldn't retrieve GOLD data right now.\n\n"
+            "Check your Twelve Data API key and try again."
         )
 
         return
 
-    trade = active_trade
-
-    message = (
-        "👑 *ACTIVE XAU/USD TRADE* 👑\n\n"
-
-        f"Direction: *{trade['signal']}*\n\n"
-
-        f"Entry: `${trade['entry']:,.2f}`\n"
-
-        f"SL: `${trade['sl']:,.2f}`\n\n"
-
-        f"TP1: `${trade['tp1']:,.2f}`\n"
-
-        f"TP2: `${trade['tp2']:,.2f}`\n"
-
-        f"TP3: `${trade['tp3']:,.2f}`\n\n"
-
-        f"TP1 hit: "
-        f"{'✅' if trade['tp1_hit'] else '⏳'}\n"
-
-        f"TP2 hit: "
-        f"{'✅' if trade['tp2_hit'] else '⏳'}\n"
-
-        f"TP3 hit: "
-        f"{'✅' if trade['tp3_hit'] else '⏳'}"
+    message = format_signal(
+        analysis
     )
 
     await update.message.reply_text(
@@ -1285,27 +905,175 @@ async def trade_command(
 
 
 # ============================================================
-# ERROR HANDLER
+# AUTOMATIC SCANNER
 # ============================================================
 
-async def error_handler(
-    update,
-    context,
-):
+async def automatic_scanner():
 
-    logger.error(
-        "Telegram error: %s",
-        context.error,
+    global scanner_running
+    global last_signal_key
+    global last_signal_time
+
+    scanner_running = True
+
+    logger.info(
+        "🟢 Automatic GOLD scanner started."
+    )
+
+    while True:
+
+        try:
+
+            analysis = await asyncio.to_thread(
+                scan_gold
+            )
+
+            if analysis:
+
+                side = analysis["side"]
+
+                price = analysis["price"]
+
+                confidence = analysis["confidence"]
+
+                # Signal key changes when direction/price zone changes
+                price_zone = round(
+                    price,
+                    1,
+                )
+
+                signal_key = (
+                    f"{side}_{price_zone}"
+                )
+
+                current_time = time.time()
+
+                # Send if:
+                # 1. New signal
+                # 2. At least 30 minutes have passed
+                #    since previous signal
+
+                should_send = False
+
+                if last_signal_key is None:
+
+                    should_send = True
+
+                elif signal_key != last_signal_key:
+
+                    should_send = True
+
+                elif (
+                    current_time
+                    - last_signal_time
+                    >= 1800
+                ):
+
+                    should_send = True
+
+                if should_send:
+
+                    message = format_signal(
+                        analysis
+                    )
+
+                    sent = await send_message(
+                        message
+                    )
+
+                    if sent:
+
+                        last_signal_key = signal_key
+                        last_signal_time = current_time
+
+                        logger.info(
+                            "📨 GOLD signal sent to Telegram."
+                        )
+
+                    else:
+
+                        logger.warning(
+                            "⚠️ Signal generated, "
+                            "but Telegram message was not sent."
+                        )
+
+        except Exception as e:
+
+            logger.exception(
+                f"Automatic scanner error: {e}"
+            )
+
+        await asyncio.sleep(
+            SCAN_INTERVAL_SECONDS
+        )
+
+
+# ============================================================
+# START BACKGROUND SCANNER
+# ============================================================
+
+def start_scanner_thread():
+
+    def runner():
+
+        try:
+
+            asyncio.run(
+                automatic_scanner()
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                f"Scanner thread stopped: {e}"
+            )
+
+    thread = Thread(
+        target=runner,
+        daemon=True,
+    )
+
+    thread.start()
+
+    logger.info(
+        "🟢 Scanner background thread launched."
     )
 
 
 # ============================================================
-# START TELEGRAM APPLICATION
+# TELEGRAM BOT
 # ============================================================
 
-async def start_bot():
+async def post_init(
+    application: Application,
+):
 
-    global bot_application
+    global telegram_application
+
+    telegram_application = application
+
+    logger.info(
+        "🟢 Telegram application initialized."
+    )
+
+    saved_chat_id = load_chat_id()
+
+    if saved_chat_id:
+
+        logger.info(
+            f"Saved Telegram Chat ID: "
+            f"{saved_chat_id}"
+        )
+
+    else:
+
+        logger.warning(
+            "No Telegram Chat ID saved yet. "
+            "Send /start to the bot."
+        )
+
+
+def create_telegram_application():
 
     if not TELEGRAM_BOT_TOKEN:
 
@@ -1313,28 +1081,12 @@ async def start_bot():
             "TELEGRAM_BOT_TOKEN is missing."
         )
 
-    if not TWELVE_DATA_API_KEY:
-
-        raise RuntimeError(
-            "TWELVE_DATA_API_KEY is missing."
-        )
-
-    logger.info(
-        "Starting %s",
-        BOT_NAME,
-    )
-
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
-
-    bot_application = application
-
-    # ========================================================
-    # COMMANDS
-    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1357,71 +1109,7 @@ async def start_bot():
         )
     )
 
-    application.add_handler(
-        CommandHandler(
-            "trade",
-            trade_command,
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    # ========================================================
-    # START
-    # ========================================================
-
-    await application.initialize()
-
-    await application.start()
-
-    await application.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-    logger.info(
-        "Telegram polling started."
-    )
-
-    # ========================================================
-    # BACKGROUND MARKET SCANNER
-    # ========================================================
-
-    monitor_task = asyncio.create_task(
-        background_monitor(
-            application
-        )
-    )
-
-    try:
-
-        while not stop_event.is_set():
-
-            await asyncio.sleep(1)
-
-    finally:
-
-        logger.info(
-            "Stopping bot..."
-        )
-
-        monitor_task.cancel()
-
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-
-        await application.updater.stop()
-
-        await application.stop()
-
-        await application.shutdown()
-
-        logger.info(
-            "Bot shutdown complete."
-        )
+    return application
 
 
 # ============================================================
@@ -1430,47 +1118,98 @@ async def start_bot():
 
 def main():
 
-    # Flask health server
-    flask_thread = threading.Thread(
+    global telegram_application
+
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    logger.info(
+        f"{BOT_NAME}"
+    )
+
+    logger.info(
+        "🟢 Starting bot..."
+    )
+
+    logger.info(
+        f"Market: {XAU_SYMBOL}"
+    )
+
+    logger.info(
+        f"Timeframe: {INTERVAL}"
+    )
+
+    logger.info(
+        f"Scan interval: "
+        f"{SCAN_INTERVAL_SECONDS} seconds"
+    )
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        logger.error(
+            "❌ TELEGRAM_BOT_TOKEN is missing."
+        )
+
+        return
+
+    if not TWELVE_DATA_API_KEY:
+
+        logger.error(
+            "❌ TWELVE_DATA_API_KEY is missing."
+        )
+
+        return
+
+    # Start Flask for Render
+    flask_thread = Thread(
         target=run_flask,
         daemon=True,
-        name="FlaskServer",
     )
 
     flask_thread.start()
 
     logger.info(
-        "Flask server started on port %s",
-        PORT,
+        "🟢 Flask server started."
     )
 
-    try:
+    # Create Telegram application
+    telegram_application = (
+        create_telegram_application()
+    )
 
-        asyncio.run(
-            start_bot()
-        )
+    # Start automatic scanner
+    start_scanner_thread()
 
-    except KeyboardInterrupt:
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
-        logger.info(
-            "Keyboard interrupt received."
-        )
+    logger.info(
+        "👑 KING OF XAU_NAS IS ONLINE"
+    )
 
-    except Exception as e:
+    logger.info(
+        "🟢 Telegram monitoring active."
+    )
 
-        logger.exception(
-            "Fatal error: %s",
-            e,
-        )
+    logger.info(
+        "🟡 XAU/USD scanner active."
+    )
 
-    finally:
+    logger.info(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
-        stop_event.set()
+    # Run Telegram bot
+    telegram_application.run_polling(
+        drop_pending_updates=True
+    )
 
-        logger.info(
-            "KING OF XAU_NAS stopped."
-        )
 
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
