@@ -2505,16 +2505,12 @@ async def monitor_trades(
                         changed = True
 
                         await send_chat_message(
-                            context,
-                            (
-                                "👑 *TP3 HIT — "
-                                "TRADE COMPLETE*\n\n"
-
-                                f"🟡 XAU/USD "
-                                f"{side}\n"
-
-                                f"💰 Exit: "
-                                f"`${price:,.2f}`\n"
-
-                                "🏆 Full target "
-                               
+    context,
+    (
+        "👑 *TP3 HIT — TRADE COMPLETE*\n\n"
+        f"🟡 XAU/USD {side}\n"
+        f"💰 Exit: `${price:,.2f}`\n"
+        "🏆 Full target reached.\n"
+        "✅ Trade closed successfully."
+    )
+)
