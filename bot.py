@@ -17,35 +17,28 @@ from telegram.ext import (
 
 # ============================================================
 # 👑 KING OF XAU_NAS — GOLD
-# STRICT GOLD SIGNAL ENGINE
+# ADVANCED CONFIRMATION ENGINE
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS — GOLD"
 
-# ============================================================
-# ENVIRONMENT VARIABLES
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
-
-TWELVE_DATA_API_KEY = os.getenv(
-    "TWELVE_DATA_API_KEY", ""
-).strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
 # ============================================================
-# MARKET SETTINGS
+# MARKET
 # ============================================================
 
 XAU_SYMBOL = "XAU/USD"
 INTERVAL = "15min"
 OUTPUT_SIZE = 100
 
-# Scan every 10 minutes
-SCAN_INTERVAL_SECONDS = 600
+# Scan every 5 minutes.
+# This lets the bot check more frequently while still using
+# 15-minute candles for the actual analysis.
+SCAN_INTERVAL_SECONDS = 300
 
 # ============================================================
 # STORAGE
@@ -69,16 +62,20 @@ logger = logging.getLogger(BOT_NAME)
 # ============================================================
 
 telegram_application = None
+
 chat_id_lock = Lock()
 
-last_signal_key = None
-last_signal_time = 0
+last_confirmed_key = None
+last_alert_time = 0
+
+last_stage = None
+last_setup_key = None
 
 scanner_running = False
 
 
 # ============================================================
-# FLASK SERVER
+# FLASK
 # ============================================================
 
 app = Flask(__name__)
@@ -88,22 +85,22 @@ app = Flask(__name__)
 def home():
     return """
     <html>
-        <head>
-            <title>King of XAU_NAS</title>
-        </head>
-        <body style="
-            background:#111;
-            color:white;
-            font-family:Arial;
-            text-align:center;
-            padding-top:50px;
-        ">
-            <h1>👑 KING OF XAU_NAS — GOLD</h1>
-            <h2>🟢 BOT ONLINE</h2>
-            <p>Market: XAU/USD</p>
-            <p>Timeframe: 15 Minutes</p>
-            <p>Signal Engine: STRICT</p>
-        </body>
+    <head>
+        <title>King of XAU_NAS</title>
+    </head>
+    <body style="
+        background:#111;
+        color:white;
+        font-family:Arial;
+        text-align:center;
+        padding-top:50px;
+    ">
+        <h1>👑 KING OF XAU_NAS — GOLD</h1>
+        <h2>🟢 BOT ONLINE</h2>
+        <p>XAU/USD</p>
+        <p>15 Minute Analysis</p>
+        <p>Advanced Confirmation Engine</p>
+    </body>
     </html>
     """
 
@@ -131,7 +128,7 @@ def run_flask():
 
 
 # ============================================================
-# CHAT ID STORAGE
+# CHAT ID
 # ============================================================
 
 def load_chat_id():
@@ -143,8 +140,8 @@ def load_chat_id():
             CHAT_ID_FILE,
             "r",
             encoding="utf-8",
-        ) as file:
-            data = json.load(file)
+        ) as f:
+            data = json.load(f)
 
         chat_id = data.get("chat_id")
 
@@ -164,7 +161,7 @@ def save_chat_id(chat_id):
                 CHAT_ID_FILE,
                 "w",
                 encoding="utf-8",
-            ) as file:
+            ) as f:
                 json.dump(
                     {
                         "chat_id": str(chat_id),
@@ -172,12 +169,12 @@ def save_chat_id(chat_id):
                             timezone.utc
                         ).isoformat(),
                     },
-                    file,
+                    f,
                     indent=4,
                 )
 
         logger.info(
-            "Telegram Chat ID saved automatically."
+            f"Telegram Chat ID saved: {chat_id}"
         )
 
         return True
@@ -186,29 +183,25 @@ def save_chat_id(chat_id):
         logger.error(
             f"Chat ID save error: {e}"
         )
+
         return False
 
 
 # ============================================================
-# SEND TELEGRAM MESSAGE
+# TELEGRAM
 # ============================================================
 
 async def send_message(message):
-    global telegram_application
-
     chat_id = load_chat_id()
 
     if not chat_id:
         logger.warning(
-            "No Telegram Chat ID saved. "
+            "No Telegram Chat ID. "
             "Send /start first."
         )
         return False
 
     if telegram_application is None:
-        logger.warning(
-            "Telegram application is not ready."
-        )
         return False
 
     try:
@@ -224,6 +217,7 @@ async def send_message(message):
         logger.error(
             f"Telegram send error: {e}"
         )
+
         return False
 
 
@@ -235,6 +229,7 @@ async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.effective_chat:
         return
 
@@ -252,24 +247,27 @@ async def start_command(
     saved = save_chat_id(chat_id)
 
     if saved:
+
         message = (
             "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
             "🟢 *BOT CONNECTED*\n\n"
             f"👤 User: {username}\n"
             f"🆔 Chat ID: `{chat_id}`\n\n"
-            "✅ Your Telegram Chat ID has been "
-            "automatically detected and saved.\n\n"
+            "✅ Chat ID automatically detected "
+            "and saved.\n\n"
             "🟡 Market: XAU/USD\n"
             "⏱ Timeframe: 15 Minutes\n"
             "🤖 Automatic Scanner: ON\n"
-            "🧠 Signal Engine: STRICT\n\n"
-            "Use /scan to request a live GOLD scan.\n"
-            "Use /status to check the bot."
+            "🧠 Confirmation Engine: ON\n\n"
+            "Use /scan for a live scan.\n"
+            "Use /status for system status."
         )
+
     else:
+
         message = (
             "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
-            "⚠️ Chat ID was detected but could "
+            "⚠️ Chat ID detected but could "
             "not be saved.\n\n"
             f"🆔 Chat ID: `{chat_id}`"
         )
@@ -288,6 +286,7 @@ async def status_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     chat_id = load_chat_id()
 
     telegram_status = (
@@ -311,25 +310,28 @@ async def status_command(
     message = (
         "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 *SYSTEM STATUS*\n"
+        "⚙️ *SYSTEM STATUS*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Telegram: {telegram_status}\n"
         f"Twelve Data: {data_status}\n"
-        f"Market: 🟡 XAU/USD\n"
-        f"Timeframe: {INTERVAL}\n"
         f"Scanner: {scanner_status}\n"
-        "Signal Engine: 🧠 STRICT\n"
-        "RSI Protection: 🛡️ ON\n"
-        "Overextension Filter: 🛡️ ON\n"
+        "Market: 🟡 XAU/USD\n"
+        "Timeframe: 15min\n\n"
+        "🧠 Confirmation Engine: ON\n"
+        "🚀 Breakout Detection: ON\n"
+        "🔄 Pullback Detection: ON\n"
+        "⚡ Reversal Detection: ON\n"
+        "🛡️ RSI Protection: ON\n"
+        "🛡️ ATR Protection: ON\n"
     )
 
     if chat_id:
         message += (
-            f"\n🆔 Saved Chat ID: `{chat_id}`\n"
+            f"\n🆔 Chat ID: `{chat_id}`"
         )
     else:
         message += (
-            "\nSend /start to register your Telegram Chat ID.\n"
+            "\nSend /start to register your Chat ID."
         )
 
     await update.message.reply_text(
@@ -343,9 +345,10 @@ async def status_command(
 # ============================================================
 
 def get_gold_data():
+
     if not TWELVE_DATA_API_KEY:
         logger.error(
-            "TWELVE_DATA_API_KEY is missing."
+            "TWELVE_DATA_API_KEY missing."
         )
         return None
 
@@ -363,6 +366,7 @@ def get_gold_data():
     }
 
     try:
+
         response = requests.get(
             url,
             params=params,
@@ -371,7 +375,7 @@ def get_gold_data():
 
         if response.status_code != 200:
             logger.error(
-                f"Twelve Data HTTP error: "
+                f"Twelve Data HTTP "
                 f"{response.status_code}"
             )
             return None
@@ -391,7 +395,9 @@ def get_gold_data():
         candles = []
 
         for item in values:
+
             try:
+
                 candles.append(
                     {
                         "datetime": item["datetime"],
@@ -401,21 +407,24 @@ def get_gold_data():
                         "close": float(item["close"]),
                     }
                 )
+
             except Exception:
                 continue
 
         if len(candles) < 60:
             logger.error(
-                "Not enough GOLD candles."
+                "Not enough candles."
             )
             return None
 
         return candles
 
     except Exception as e:
+
         logger.error(
             f"Gold data error: {e}"
         )
+
         return None
 
 
@@ -424,6 +433,7 @@ def get_gold_data():
 # ============================================================
 
 def calculate_ema(values, period):
+
     if len(values) < period:
         return None
 
@@ -447,6 +457,7 @@ def calculate_ema(values, period):
 # ============================================================
 
 def calculate_rsi(values, period=14):
+
     if len(values) < period + 1:
         return None
 
@@ -454,17 +465,23 @@ def calculate_rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
+
         change = (
             values[i]
             - values[i - 1]
         )
 
         if change > 0:
+
             gains.append(change)
             losses.append(0)
+
         else:
+
             gains.append(0)
-            losses.append(abs(change))
+            losses.append(
+                abs(change)
+            )
 
     avg_gain = (
         sum(gains[:period])
@@ -476,7 +493,11 @@ def calculate_rsi(values, period=14):
         / period
     )
 
-    for i in range(period, len(gains)):
+    for i in range(
+        period,
+        len(gains),
+    ):
+
         avg_gain = (
             (
                 avg_gain
@@ -511,39 +532,46 @@ def calculate_atr(
     candles,
     period=14,
 ):
+
     if len(candles) < period + 1:
         return None
 
     true_ranges = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles),
+    ):
+
         current = candles[i]
         previous = candles[i - 1]
 
-        high = current["high"]
-        low = current["low"]
-        previous_close = previous["close"]
-
         tr = max(
-            high - low,
+            current["high"]
+            - current["low"],
+
             abs(
-                high
-                - previous_close
+                current["high"]
+                - previous["close"]
             ),
+
             abs(
-                low
-                - previous_close
+                current["low"]
+                - previous["close"]
             ),
         )
 
         true_ranges.append(tr)
 
     atr = (
-        sum(true_ranges[:period])
+        sum(
+            true_ranges[:period]
+        )
         / period
     )
 
     for tr in true_ranges[period:]:
+
         atr = (
             (
                 atr
@@ -556,10 +584,11 @@ def calculate_atr(
 
 
 # ============================================================
-# CANDLE MOMENTUM
+# MOMENTUM
 # ============================================================
 
-def candle_momentum(candles):
+def get_momentum(candles):
+
     if len(candles) < 5:
         return "NEUTRAL"
 
@@ -605,23 +634,24 @@ def candle_momentum(candles):
 
 
 # ============================================================
-# MARKET ANALYSIS
+# CONFIRMATION ENGINE
 # ============================================================
 
 def analyze_gold(candles):
+
     closes = [
-        candle["close"]
-        for candle in candles
+        x["close"]
+        for x in candles
     ]
 
     highs = [
-        candle["high"]
-        for candle in candles
+        x["high"]
+        for x in candles
     ]
 
     lows = [
-        candle["low"]
-        for candle in candles
+        x["low"]
+        for x in candles
     ]
 
     price = closes[-1]
@@ -646,9 +676,13 @@ def analyze_gold(candles):
         14,
     )
 
+    momentum = get_momentum(
+        candles
+    )
+
     if any(
-        value is None
-        for value in (
+        x is None
+        for x in (
             ema20,
             ema50,
             rsi,
@@ -657,39 +691,58 @@ def analyze_gold(candles):
     ):
         return None
 
-    momentum = candle_momentum(
-        candles
-    )
-
-    recent_high = max(
-        highs[-20:]
-    )
-
-    recent_low = min(
-        lows[-20:]
-    )
-
     # ========================================================
-    # TREND
+    # MARKET TREND
     # ========================================================
 
-    if (
+    bullish_trend = (
         price > ema20
         and ema20 > ema50
-    ):
-        trend = "BULLISH 📈"
+    )
 
-    elif (
+    bearish_trend = (
         price < ema20
         and ema20 < ema50
-    ):
+    )
+
+    if bullish_trend:
+
+        trend = "BULLISH 📈"
+
+    elif bearish_trend:
+
         trend = "BEARISH 📉"
 
     else:
+
         trend = "RANGING ↔️"
 
     # ========================================================
-    # ATR DISTANCE FROM EMA20
+    # STRUCTURE
+    # ========================================================
+
+    resistance = max(
+        highs[-20:-1]
+    )
+
+    support = min(
+        lows[-20:-1]
+    )
+
+    previous_close = closes[-2]
+
+    breakout_up = (
+        price > resistance
+        and previous_close <= resistance
+    )
+
+    breakout_down = (
+        price < support
+        and previous_close >= support
+    )
+
+    # ========================================================
+    # EMA DISTANCE
     # ========================================================
 
     atr_distance = (
@@ -698,225 +751,451 @@ def analyze_gold(candles):
         else 0
     )
 
-    overextended_up = (
-        price > ema20
-        and atr_distance >= 2.5
+    # ========================================================
+    # PULLBACK ZONES
+    # ========================================================
+
+    bullish_pullback_zone = (
+        ema20 - atr * 0.75,
+        ema20 + atr * 0.25,
     )
 
-    overextended_down = (
-        price < ema20
-        and atr_distance >= 2.5
+    bearish_pullback_zone = (
+        ema20 - atr * 0.25,
+        ema20 + atr * 0.75,
+    )
+
+    price_in_bullish_pullback = (
+        bullish_pullback_zone[0]
+        <= price
+        <= bullish_pullback_zone[1]
+    )
+
+    price_in_bearish_pullback = (
+        bearish_pullback_zone[0]
+        <= price
+        <= bearish_pullback_zone[1]
     )
 
     # ========================================================
-    # SCORE
+    # RSI STATES
     # ========================================================
 
-    buy_score = 0
-    sell_score = 0
+    bullish_rsi = (
+        50 <= rsi <= 68
+    )
 
-    reasons = []
+    bearish_rsi = (
+        32 <= rsi <= 50
+    )
 
-    # Trend
+    extreme_overbought = (
+        rsi >= 75
+    )
 
-    if price > ema20:
-        buy_score += 20
-
-    if price > ema50:
-        buy_score += 15
-
-    if ema20 > ema50:
-        buy_score += 15
-
-    if price < ema20:
-        sell_score += 20
-
-    if price < ema50:
-        sell_score += 15
-
-    if ema20 < ema50:
-        sell_score += 15
+    extreme_oversold = (
+        rsi <= 25
+    )
 
     # ========================================================
-    # RSI FILTER
+    # REVERSAL CONFIRMATION
     # ========================================================
 
-    if 50 <= rsi < 65:
-        buy_score += 15
-        reasons.append(
-            "RSI supports bullish momentum"
+    recent = candles[-3:]
+
+    bearish_reversal_candle = (
+        recent[-1]["close"]
+        < recent[-1]["open"]
+        and recent[-1]["close"]
+        < recent[-2]["close"]
+    )
+
+    bullish_reversal_candle = (
+        recent[-1]["close"]
+        > recent[-1]["open"]
+        and recent[-1]["close"]
+        > recent[-2]["close"]
+    )
+
+    bearish_reversal = (
+        extreme_overbought
+        and bearish_reversal_candle
+        and momentum == "BEARISH"
+    )
+
+    bullish_reversal = (
+        extreme_oversold
+        and bullish_reversal_candle
+        and momentum == "BULLISH"
+    )
+
+    # ========================================================
+    # SETUP TYPE
+    # ========================================================
+
+    setup_type = "WAIT"
+
+    if breakout_up:
+
+        setup_type = "BREAKOUT BUY"
+
+    elif breakout_down:
+
+        setup_type = "BREAKOUT SELL"
+
+    elif bearish_reversal:
+
+        setup_type = "REVERSAL SELL"
+
+    elif bullish_reversal:
+
+        setup_type = "REVERSAL BUY"
+
+    elif bullish_trend:
+
+        setup_type = "BULLISH PULLBACK"
+
+    elif bearish_trend:
+
+        setup_type = "BEARISH PULLBACK"
+
+    # ========================================================
+    # CONDITIONS
+    # ========================================================
+
+    conditions = []
+    failed = []
+
+    # ========================================================
+    # BULLISH PULLBACK
+    # ========================================================
+
+    if bullish_trend:
+
+        conditions.append(
+            "Bullish EMA structure"
         )
 
-    elif 65 <= rsi < 72:
-        buy_score += 5
-        reasons.append(
-            "RSI elevated"
-        )
+        if price_in_bullish_pullback:
 
-    elif rsi >= 72:
-        buy_score -= 15
-        reasons.append(
-            "RSI overbought"
-        )
+            conditions.append(
+                "Price inside pullback zone"
+            )
 
-    if 35 < rsi <= 50:
-        sell_score += 15
-        reasons.append(
-            "RSI supports bearish momentum"
-        )
+        else:
 
-    elif 28 < rsi <= 35:
-        sell_score += 5
-        reasons.append(
-            "RSI low"
-        )
+            failed.append(
+                "Price not yet inside pullback zone"
+            )
 
-    elif rsi <= 28:
-        sell_score -= 15
-        reasons.append(
-            "RSI oversold"
-        )
+        if bullish_rsi:
 
-    # ========================================================
-    # CANDLE MOMENTUM
-    # ========================================================
+            conditions.append(
+                "RSI healthy"
+            )
 
-    if momentum == "BULLISH":
-        buy_score += 10
+        else:
 
-    elif momentum == "BEARISH":
-        sell_score += 10
+            failed.append(
+                "RSI not yet confirmed"
+            )
+
+        if momentum == "BULLISH":
+
+            conditions.append(
+                "Bullish momentum"
+            )
+
+        else:
+
+            failed.append(
+                "Bullish momentum missing"
+            )
 
     # ========================================================
-    # OVEREXTENSION
+    # BEARISH PULLBACK
     # ========================================================
 
-    if overextended_up:
-        buy_score -= 20
-        reasons.append(
-            "Price is extended above EMA20"
+    if bearish_trend:
+
+        conditions.append(
+            "Bearish EMA structure"
         )
 
-    if overextended_down:
-        sell_score -= 20
-        reasons.append(
-            "Price is extended below EMA20"
+        if price_in_bearish_pullback:
+
+            conditions.append(
+                "Price inside pullback zone"
+            )
+
+        else:
+
+            failed.append(
+                "Price not yet inside pullback zone"
+            )
+
+        if bearish_rsi:
+
+            conditions.append(
+                "RSI healthy"
+            )
+
+        else:
+
+            failed.append(
+                "RSI not yet confirmed"
+            )
+
+        if momentum == "BEARISH":
+
+            conditions.append(
+                "Bearish momentum"
+            )
+
+        else:
+
+            failed.append(
+                "Bearish momentum missing"
+            )
+
+    # ========================================================
+    # BREAKOUT
+    # ========================================================
+
+    if breakout_up:
+
+        if bullish_trend:
+
+            conditions.append(
+                "Bullish trend confirmed"
+            )
+
+        if momentum == "BULLISH":
+
+            conditions.append(
+                "Bullish breakout momentum"
+            )
+
+        else:
+
+            failed.append(
+                "Breakout momentum missing"
+            )
+
+        if rsi < 75:
+
+            conditions.append(
+                "RSI not extremely overbought"
+            )
+
+        else:
+
+            failed.append(
+                "RSI too overbought"
+            )
+
+    if breakout_down:
+
+        if bearish_trend:
+
+            conditions.append(
+                "Bearish trend confirmed"
+            )
+
+        if momentum == "BEARISH":
+
+            conditions.append(
+                "Bearish breakout momentum"
+            )
+
+        else:
+
+            failed.append(
+                "Breakout momentum missing"
+            )
+
+        if rsi > 25:
+
+            conditions.append(
+                "RSI not extremely oversold"
+            )
+
+        else:
+
+            failed.append(
+                "RSI too oversold"
+            )
+
+    # ========================================================
+    # REVERSAL
+    # ========================================================
+
+    if setup_type == "REVERSAL SELL":
+
+        conditions = [
+            "RSI extremely overbought",
+            "Bearish reversal candle",
+            "Bearish momentum",
+        ]
+
+    elif setup_type == "REVERSAL BUY":
+
+        conditions = [
+            "RSI extremely oversold",
+            "Bullish reversal candle",
+            "Bullish momentum",
+        ]
+
+    # ========================================================
+    # DETERMINE CONFIRMATION
+    # ========================================================
+
+    confirmed = False
+
+    if setup_type == "BREAKOUT BUY":
+
+        confirmed = (
+            bullish_trend
+            and momentum == "BULLISH"
+            and rsi < 75
         )
 
-    # Extreme conditions
+    elif setup_type == "BREAKOUT SELL":
 
-    if rsi >= 75 and overextended_up:
-        buy_score -= 20
-        reasons.append(
-            "Extreme overbought + extension"
+        confirmed = (
+            bearish_trend
+            and momentum == "BEARISH"
+            and rsi > 25
         )
 
-    if rsi <= 25 and overextended_down:
-        sell_score -= 20
-        reasons.append(
-            "Extreme oversold + extension"
+    elif setup_type == "BULLISH PULLBACK":
+
+        confirmed = (
+            bullish_trend
+            and price_in_bullish_pullback
+            and bullish_rsi
+            and momentum == "BULLISH"
         )
 
+    elif setup_type == "BEARISH PULLBACK":
+
+        confirmed = (
+            bearish_trend
+            and price_in_bearish_pullback
+            and bearish_rsi
+            and momentum == "BEARISH"
+        )
+
+    elif setup_type == "REVERSAL SELL":
+
+        confirmed = bearish_reversal
+
+    elif setup_type == "REVERSAL BUY":
+
+        confirmed = bullish_reversal
+
     # ========================================================
-    # STRUCTURE
+    # STAGE
     # ========================================================
 
-    if price >= recent_high * 0.998:
-        buy_score += 5
+    if confirmed:
 
-    if price <= recent_low * 1.002:
-        sell_score += 5
+        stage = "CONFIRMED"
 
-    # ========================================================
-    # DIRECTION
-    # ========================================================
+    elif len(conditions) >= 2:
 
-    if buy_score > sell_score:
-        direction = "BUY"
-        raw_score = buy_score
+        stage = "NEAR CONFIRMATION"
 
-    elif sell_score > buy_score:
-        direction = "SELL"
-        raw_score = sell_score
+    elif len(conditions) >= 1:
+
+        stage = "SETUP FORMING"
 
     else:
-        direction = "WAIT"
-        raw_score = 50
 
-    # ========================================================
-    # HARD SAFETY FILTER
-    # ========================================================
-
-    wait_reason = ""
-
-    if (
-        rsi >= 75
-        and price > ema20
-    ):
-        direction = "WAIT"
-        wait_reason = (
-            "RSI is extremely overbought"
-        )
-
-    elif (
-        rsi <= 25
-        and price < ema20
-    ):
-        direction = "WAIT"
-        wait_reason = (
-            "RSI is extremely oversold"
-        )
-
-    elif overextended_up:
-        direction = "WAIT"
-        wait_reason = (
-            "Price is too far above EMA20"
-        )
-
-    elif overextended_down:
-        direction = "WAIT"
-        wait_reason = (
-            "Price is too far below EMA20"
-        )
-
-    elif trend == "RANGING":
-        direction = "WAIT"
-        wait_reason = (
-            "Market structure is ranging"
-        )
+        stage = "WAIT"
 
     # ========================================================
     # CONFIDENCE
     # ========================================================
 
-    if direction == "WAIT":
-        confidence = 50
-    else:
-        confidence = min(
-            max(raw_score, 50),
-            95,
+    total_possible = max(
+        len(conditions)
+        + len(failed),
+        1,
+    )
+
+    confidence = (
+        len(conditions)
+        / total_possible
+    ) * 100
+
+    if confirmed:
+        confidence = max(
+            confidence,
+            80,
         )
 
     # ========================================================
-    # SIGNAL NAME
+    # TRADE DIRECTION
     # ========================================================
 
-    if direction == "BUY":
+    if (
+        setup_type in
+        (
+            "BREAKOUT BUY",
+            "BULLISH PULLBACK",
+            "REVERSAL BUY",
+        )
+    ):
 
-        if confidence >= 80:
-            signal = "STRONG BUY 🟢🟢"
-        else:
-            signal = "BUY 🟢"
+        direction = "BUY"
 
-    elif direction == "SELL":
+    elif (
+        setup_type in
+        (
+            "BREAKOUT SELL",
+            "BEARISH PULLBACK",
+            "REVERSAL SELL",
+        )
+    ):
 
-        if confidence >= 80:
-            signal = "STRONG SELL 🔴🔴"
-        else:
-            signal = "SELL 🔴"
+        direction = "SELL"
 
     else:
-        signal = "WAIT / PULLBACK 🟡"
+
+        direction = "WAIT"
+
+    # ========================================================
+    # EXTREME PROTECTION
+    # ========================================================
+
+    if (
+        bullish_trend
+        and rsi >= 75
+        and not bearish_reversal
+        and not breakout_up
+    ):
+
+        stage = "WAIT"
+        direction = "WAIT"
+
+        failed.append(
+            "Extreme overbought condition"
+        )
+
+    if (
+        bearish_trend
+        and rsi <= 25
+        and not bullish_reversal
+        and not breakout_down
+    ):
+
+        stage = "WAIT"
+        direction = "WAIT"
+
+        failed.append(
+            "Extreme oversold condition"
+        )
 
     # ========================================================
     # TRADE LEVELS
@@ -982,25 +1261,23 @@ def analyze_gold(candles):
         tp2 = None
         tp3 = None
 
-        if trend == "BULLISH 📈":
+        pending_type = (
+            "WATCH PULLBACK"
+        )
 
-            pending_type = "BUY LIMIT WATCH"
+        if bullish_trend:
 
             pending_entry = (
-                price - atr * 0.50
+                ema20 - atr * 0.25
             )
 
-        elif trend == "BEARISH 📉":
-
-            pending_type = "SELL LIMIT WATCH"
+        elif bearish_trend:
 
             pending_entry = (
-                price + atr * 0.50
+                ema20 + atr * 0.25
             )
 
         else:
-
-            pending_type = "NO ENTRY"
 
             pending_entry = None
 
@@ -1012,12 +1289,16 @@ def analyze_gold(candles):
         "atr": atr,
         "trend": trend,
         "momentum": momentum,
+        "resistance": resistance,
+        "support": support,
         "atr_distance": atr_distance,
-        "buy_score": buy_score,
-        "sell_score": sell_score,
+        "setup_type": setup_type,
+        "stage": stage,
+        "confirmed": confirmed,
         "direction": direction,
-        "signal": signal,
         "confidence": confidence,
+        "conditions": conditions,
+        "failed": failed,
         "entry": entry,
         "stop_loss": stop_loss,
         "tp1": tp1,
@@ -1025,133 +1306,215 @@ def analyze_gold(candles):
         "tp3": tp3,
         "pending_type": pending_type,
         "pending_entry": pending_entry,
-        "wait_reason": wait_reason,
-        "recent_high": recent_high,
-        "recent_low": recent_low,
-        "reasons": reasons,
+        "bullish_pullback_zone": bullish_pullback_zone,
+        "bearish_pullback_zone": bearish_pullback_zone,
     }
 
 
 # ============================================================
-# FORMAT SIGNAL
+# FORMAT MESSAGE
 # ============================================================
 
-def format_signal(analysis):
+def format_signal(a):
 
-    direction = analysis["direction"]
+    stage = a["stage"]
+    direction = a["direction"]
+
+    if stage == "CONFIRMED":
+
+        if direction == "BUY":
+            header = (
+                "🚨 *SIGNAL CONFIRMED — BUY* 🚨"
+            )
+
+        elif direction == "SELL":
+            header = (
+                "🚨 *SIGNAL CONFIRMED — SELL* 🚨"
+            )
+
+        else:
+            header = (
+                "🚨 *SIGNAL CONFIRMED* 🚨"
+            )
+
+    elif stage == "NEAR CONFIRMATION":
+
+        header = (
+            "🟠 *NEAR CONFIRMATION* 🟠"
+        )
+
+    elif stage == "SETUP FORMING":
+
+        header = (
+            "🟡 *SETUP FORMING* 🟡"
+        )
+
+    else:
+
+        header = (
+            "🟡 *WAIT / PULLBACK* 🟡"
+        )
 
     message = (
         "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
         "🟡 *XAU/USD*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🧠 *AI MARKET SIGNAL*\n"
+        f"{header}\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 Signal: *{analysis['signal']}*\n"
-        f"🎯 Confidence: "
-        f"*{analysis['confidence']:.0f}%*\n\n"
+        f"📌 Setup: *{a['setup_type']}*\n"
+        f"🎯 Stage: *{stage}*\n"
+        f"📊 Direction: *{direction}*\n"
+        f"💯 Confidence: "
+        f"*{a['confidence']:.0f}%*\n\n"
         f"💰 Price: "
-        f"`${analysis['price']:,.2f}`\n"
-        f"📈 Trend: "
-        f"*{analysis['trend']}*\n"
-        f"⚡ Momentum: "
-        f"*{analysis['momentum']}*\n\n"
+        f"`${a['price']:,.2f}`\n"
+        f"📈 Trend: *{a['trend']}*\n"
+        f"⚡ Momentum: *{a['momentum']}*\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *TECHNICAL ANALYSIS*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"EMA 20: "
-        f"`{analysis['ema20']:,.2f}`\n"
-        f"EMA 50: "
-        f"`{analysis['ema50']:,.2f}`\n"
-        f"RSI 14: "
-        f"`{analysis['rsi']:.1f}`\n"
-        f"ATR 14: "
-        f"`{analysis['atr']:.2f}`\n"
-        f"Distance from EMA20: "
-        f"`{analysis['atr_distance']:.2f} ATR`\n\n"
+        f"EMA 20: `{a['ema20']:,.2f}`\n"
+        f"EMA 50: `{a['ema50']:,.2f}`\n"
+        f"RSI 14: `{a['rsi']:.1f}`\n"
+        f"ATR 14: `{a['atr']:.2f}`\n"
+        f"EMA Distance: "
+        f"`{a['atr_distance']:.2f} ATR`\n\n"
     )
+
+    # ========================================================
+    # CONFIRMED TRADE
+    # ========================================================
+
+    if a["confirmed"]:
+
+        message += (
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🚨 *ALL CONDITIONS MET*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
+        for condition in a["conditions"]:
+
+            message += (
+                f"✅ {condition}\n"
+            )
+
+        message += (
+            "\n━━━━━━━━━━━━━━━━━━━━\n"
+            "🎯 *TRADE LEVELS*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 Entry: "
+            f"`${a['entry']:,.2f}`\n"
+            f"🛑 SL: "
+            f"`${a['stop_loss']:,.2f}`\n"
+            f"🥇 TP1: "
+            f"`${a['tp1']:,.2f}`\n"
+            f"🥈 TP2: "
+            f"`${a['tp2']:,.2f}`\n"
+            f"🏆 TP3: "
+            f"`${a['tp3']:,.2f}`\n\n"
+            "⏳ *PENDING ORDER IDEA*\n"
+            f"{a['pending_type']}: "
+            f"`{a['pending_entry']:,.2f}`\n\n"
+        )
+
+    # ========================================================
+    # NEAR / FORMING
+    # ========================================================
+
+    elif stage in (
+        "NEAR CONFIRMATION",
+        "SETUP FORMING",
+    ):
+
+        message += (
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🧠 *CONFIRMATION CHECK*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
+        for condition in a["conditions"]:
+
+            message += (
+                f"✅ {condition}\n"
+            )
+
+        for failed in a["failed"]:
+
+            message += (
+                f"⏳ {failed}\n"
+            )
+
+        message += (
+            "\n⚠️ *No confirmed trade yet.*\n"
+            "Wait for all required conditions.\n\n"
+        )
 
     # ========================================================
     # WAIT
     # ========================================================
 
-    if direction == "WAIT":
-
-        message += (
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "🟡 *ACTION: WAIT / PULLBACK*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"⚠️ {analysis['wait_reason']}\n\n"
-            "🚫 *Do not chase the current price.*\n"
-            "Wait for a pullback or fresh confirmation.\n\n"
-        )
-
-        if analysis["pending_entry"] is not None:
-
-            message += (
-                f"⏳ Watch level: "
-                f"`{analysis['pending_entry']:,.2f}`\n\n"
-            )
-
     else:
 
         message += (
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "🎯 *TRADE LEVELS*\n"
+            "🟡 *ACTION: WAIT*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🟢 Entry: "
-            f"`${analysis['entry']:,.2f}`\n"
-            f"🛑 Stop Loss: "
-            f"`${analysis['stop_loss']:,.2f}`\n"
-            f"🥇 TP1: "
-            f"`${analysis['tp1']:,.2f}`\n"
-            f"🥈 TP2: "
-            f"`${analysis['tp2']:,.2f}`\n"
-            f"🏆 TP3: "
-            f"`${analysis['tp3']:,.2f}`\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "⏳ *PENDING ORDER IDEA*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{analysis['pending_type']}: "
-            f"`{analysis['pending_entry']:,.2f}`\n\n"
+            "🚫 Do not chase the current price.\n"
+            "Wait for confirmation.\n\n"
         )
 
-    # ========================================================
-    # ENGINE NOTES
-    # ========================================================
-
-    if analysis["reasons"]:
-
-        message += (
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "🧠 *ENGINE NOTES*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-        )
-
-        used = []
-
-        for reason in analysis["reasons"]:
-
-            if reason not in used:
-
-                used.append(reason)
-
-        for reason in used[:6]:
+        if a["pending_entry"]:
 
             message += (
-                f"• {reason}\n"
+                f"⏳ Watch level: "
+                f"`{a['pending_entry']:,.2f}`\n\n"
             )
 
-        message += "\n"
+    # ========================================================
+    # PULLBACK ZONE
+    # ========================================================
+
+    if a["trend"] == "BULLISH 📈":
+
+        zone = a[
+            "bullish_pullback_zone"
+        ]
+
+        message += (
+            "🔄 *BULLISH PULLBACK ZONE*\n"
+            f"`{zone[0]:,.2f}` → "
+            f"`{zone[1]:,.2f}`\n\n"
+        )
+
+    elif a["trend"] == "BEARISH 📉":
+
+        zone = a[
+            "bearish_pullback_zone"
+        ]
+
+        message += (
+            "🔄 *BEARISH PULLBACK ZONE*\n"
+            f"`{zone[0]:,.2f}` → "
+            f"`{zone[1]:,.2f}`\n\n"
+        )
+
+    # ========================================================
+    # SYSTEM
+    # ========================================================
 
     message += (
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚙️ *SYSTEM*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⏱ Timeframe: *{INTERVAL}*\n"
+        "⏱ Timeframe: *15min*\n"
         "📡 Data: *Twelve Data*\n"
-        "🧠 Engine: *STRICT*\n"
+        "🧠 Confirmation Engine: *ON*\n"
+        "🚀 Breakout Detection: *ON*\n"
+        "🔄 Pullback Detection: *ON*\n"
+        "⚡ Reversal Detection: *ON*\n"
         "🛡️ RSI Protection: *ON*\n"
-        "🛡️ Overextension Filter: *ON*\n"
+        "🛡️ ATR Protection: *ON*\n"
         "🤖 Automatic Scanner: *ON*\n\n"
         "⚠️ Market information is for analysis only.\n"
         "Not financial advice. Manage risk carefully."
@@ -1161,7 +1524,7 @@ def format_signal(analysis):
 
 
 # ============================================================
-# GOLD SCAN
+# SCAN
 # ============================================================
 
 def scan_gold():
@@ -1183,11 +1546,11 @@ def scan_gold():
         return None
 
     logger.info(
-        f"Signal: {analysis['signal']} | "
-        f"Price: {analysis['price']:.2f} | "
-        f"RSI: {analysis['rsi']:.1f} | "
-        f"Confidence: "
-        f"{analysis['confidence']:.0f}%"
+        f"{analysis['stage']} | "
+        f"{analysis['setup_type']} | "
+        f"{analysis['direction']} | "
+        f"Price={analysis['price']:.2f} | "
+        f"RSI={analysis['rsi']:.1f}"
     )
 
     return analysis
@@ -1215,36 +1578,33 @@ async def scan_command(
     if not analysis:
 
         await update.message.reply_text(
-            "❌ GOLD data could not be retrieved.\n\n"
-            "Check your Twelve Data API key."
+            "❌ Unable to retrieve GOLD data."
         )
 
         return
 
-    message = format_signal(
-        analysis
-    )
-
     await update.message.reply_text(
-        message,
+        format_signal(analysis),
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# AUTOMATIC SCANNER
+# AUTOMATIC ALERT ENGINE
 # ============================================================
 
 async def automatic_scanner():
 
     global scanner_running
-    global last_signal_key
-    global last_signal_time
+    global last_confirmed_key
+    global last_alert_time
+    global last_stage
+    global last_setup_key
 
     scanner_running = True
 
     logger.info(
-        "🟢 Automatic GOLD scanner started."
+        "🟢 Advanced automatic scanner started."
     )
 
     while True:
@@ -1257,6 +1617,14 @@ async def automatic_scanner():
 
             if analysis:
 
+                stage = analysis[
+                    "stage"
+                ]
+
+                setup = analysis[
+                    "setup_type"
+                ]
+
                 direction = analysis[
                     "direction"
                 ]
@@ -1265,70 +1633,123 @@ async def automatic_scanner():
                     "price"
                 ]
 
-                reason = analysis[
-                    "wait_reason"
-                ]
+                # ==================================================
+                # UNIQUE SETUP
+                # ==================================================
 
                 price_zone = round(
                     price,
                     1,
                 )
 
-                signal_key = (
+                setup_key = (
+                    f"{setup}_"
                     f"{direction}_"
-                    f"{reason}_"
                     f"{price_zone}"
                 )
 
-                now = time.time()
+                # ==================================================
+                # CONFIRMED ALERT
+                # ==================================================
 
-                should_send = False
-
-                if last_signal_key is None:
-
-                    should_send = True
-
-                elif (
-                    signal_key
-                    != last_signal_key
+                if (
+                    analysis["confirmed"]
+                    and stage == "CONFIRMED"
                 ):
 
-                    should_send = True
+                    confirmed_key = (
+                        f"{setup}_"
+                        f"{direction}_"
+                        f"{round(price, 1)}"
+                    )
 
-                elif (
-                    now
-                    - last_signal_time
-                    >= 1800
+                    now = time.time()
+
+                    # New confirmation OR
+                    # more than 30 minutes since
+                    # the previous identical alert.
+                    if (
+                        confirmed_key
+                        != last_confirmed_key
+                        or
+                        now
+                        - last_alert_time
+                        >= 1800
+                    ):
+
+                        message = format_signal(
+                            analysis
+                        )
+
+                        sent = await send_message(
+                            message
+                        )
+
+                        if sent:
+
+                            last_confirmed_key = (
+                                confirmed_key
+                            )
+
+                            last_alert_time = now
+
+                            logger.info(
+                                "🚨 CONFIRMED "
+                                "SIGNAL SENT."
+                            )
+
+                # ==================================================
+                # SETUP FORMING / NEAR CONFIRMATION
+                # ==================================================
+
+                elif stage in (
+                    "SETUP FORMING",
+                    "NEAR CONFIRMATION",
                 ):
 
-                    should_send = True
+                    # Only notify when the setup stage
+                    # changes. This prevents spam every
+                    # five minutes.
+                    if (
+                        setup_key
+                        != last_setup_key
+                        or
+                        stage
+                        != last_stage
+                    ):
 
-                if should_send:
-
-                    message = format_signal(
-                        analysis
-                    )
-
-                    sent = await send_message(
-                        message
-                    )
-
-                    if sent:
-
-                        last_signal_key = (
-                            signal_key
+                        message = format_signal(
+                            analysis
                         )
 
-                        last_signal_time = now
-
-                        logger.info(
-                            "📨 GOLD signal sent."
+                        sent = await send_message(
+                            message
                         )
+
+                        if sent:
+
+                            last_setup_key = (
+                                setup_key
+                            )
+
+                            last_stage = (
+                                stage
+                            )
+
+                            logger.info(
+                                f"🟠 {stage} "
+                                "notification sent."
+                            )
+
+                else:
+
+                    # Keep the current state updated.
+                    last_stage = stage
 
         except Exception as e:
 
             logger.exception(
-                f"Scanner error: {e}"
+                f"Automatic scanner error: {e}"
             )
 
         await asyncio.sleep(
@@ -1364,12 +1785,12 @@ def start_scanner_thread():
     thread.start()
 
     logger.info(
-        "🟢 Scanner background thread launched."
+        "🟢 Automatic scanner thread launched."
     )
 
 
 # ============================================================
-# TELEGRAM INITIALIZATION
+# TELEGRAM INIT
 # ============================================================
 
 async def post_init(
@@ -1392,7 +1813,7 @@ async def post_init(
 
         logger.warning(
             "No Chat ID saved. "
-            "Send /start in Telegram."
+            "Send /start."
         )
 
 
@@ -1401,7 +1822,7 @@ def create_application():
     if not TELEGRAM_BOT_TOKEN:
 
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing."
+            "TELEGRAM_BOT_TOKEN missing."
         )
 
     application = (
@@ -1424,15 +1845,15 @@ def create_application():
 
     application.add_handler(
         CommandHandler(
-            "status",
-            status_command,
+            "scan",
+            scan_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "scan",
-            scan_command,
+            "status",
+            status_command,
         )
     )
 
@@ -1448,7 +1869,7 @@ def main():
     global telegram_application
 
     logger.info(
-        "===================================="
+        "========================================"
     )
 
     logger.info(
@@ -1456,7 +1877,7 @@ def main():
     )
 
     logger.info(
-        "🟢 Starting bot..."
+        "🟢 Starting advanced engine..."
     )
 
     logger.info(
@@ -1468,21 +1889,29 @@ def main():
     )
 
     logger.info(
-        "🧠 Strict signal engine: ON"
+        "🚀 Breakout engine: ON"
     )
 
     logger.info(
-        "🛡️ RSI protection: ON"
+        "🔄 Pullback engine: ON"
     )
 
     logger.info(
-        "🛡️ Overextension protection: ON"
+        "⚡ Reversal engine: ON"
+    )
+
+    logger.info(
+        "🧠 Confirmation engine: ON"
+    )
+
+    logger.info(
+        "========================================"
     )
 
     if not TELEGRAM_BOT_TOKEN:
 
         logger.error(
-            "❌ TELEGRAM_BOT_TOKEN is missing."
+            "❌ TELEGRAM_BOT_TOKEN missing."
         )
 
         return
@@ -1490,7 +1919,7 @@ def main():
     if not TWELVE_DATA_API_KEY:
 
         logger.error(
-            "❌ TWELVE_DATA_API_KEY is missing."
+            "❌ TWELVE_DATA_API_KEY missing."
         )
 
         return
@@ -1499,12 +1928,10 @@ def main():
     # FLASK
     # ========================================================
 
-    flask_thread = Thread(
+    Thread(
         target=run_flask,
         daemon=True,
-    )
-
-    flask_thread.start()
+    ).start()
 
     logger.info(
         "🟢 Flask server started."
@@ -1525,7 +1952,7 @@ def main():
     start_scanner_thread()
 
     logger.info(
-        "===================================="
+        "========================================"
     )
 
     logger.info(
@@ -1541,11 +1968,11 @@ def main():
     )
 
     logger.info(
-        "🧠 Signal engine: STRICT"
+        "🧠 Confirmation engine: ONLINE"
     )
 
     logger.info(
-        "===================================="
+        "========================================"
     )
 
     telegram_application.run_polling(
