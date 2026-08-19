@@ -3,7 +3,6 @@ import json
 import time
 import asyncio
 import logging
-from threading import Thread, Lock
 from datetime import datetime, timezone
 
 import requests
@@ -18,26 +17,34 @@ from telegram.ext import (
 # ============================================================
 # 👑 KING OF XAU_NAS — GOLD
 # ADVANCED CONFIRMATION ENGINE
+# RENDER + TELEGRAM VERSION
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS — GOLD"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
 
-PORT = int(os.getenv("PORT", "10000"))
+TWELVE_DATA_API_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY",
+    ""
+).strip()
+
+PORT = int(
+    os.getenv("PORT", "10000")
+)
 
 # ============================================================
-# MARKET
+# MARKET SETTINGS
 # ============================================================
 
 XAU_SYMBOL = "XAU/USD"
 INTERVAL = "15min"
 OUTPUT_SIZE = 100
 
-# Scan every 5 minutes.
-# This lets the bot check more frequently while still using
-# 15-minute candles for the actual analysis.
+# Scan every 5 minutes
 SCAN_INTERVAL_SECONDS = 300
 
 # ============================================================
@@ -45,6 +52,22 @@ SCAN_INTERVAL_SECONDS = 300
 # ============================================================
 
 CHAT_ID_FILE = "telegram_chat_id.json"
+
+# Runtime Chat ID
+# This is updated immediately when /start is used.
+TELEGRAM_CHAT_ID = None
+
+# ============================================================
+# ALERT STATE
+# ============================================================
+
+last_confirmed_key = None
+last_confirmed_time = 0
+
+last_setup_key = None
+last_setup_stage = None
+
+scanner_running = False
 
 # ============================================================
 # LOGGING
@@ -58,23 +81,6 @@ logging.basicConfig(
 logger = logging.getLogger(BOT_NAME)
 
 # ============================================================
-# GLOBAL STATE
-# ============================================================
-
-telegram_application = None
-
-chat_id_lock = Lock()
-
-last_confirmed_key = None
-last_alert_time = 0
-
-last_stage = None
-last_setup_key = None
-
-scanner_running = False
-
-
-# ============================================================
 # FLASK
 # ============================================================
 
@@ -84,10 +90,14 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return """
+    <!DOCTYPE html>
     <html>
     <head>
         <title>King of XAU_NAS</title>
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
     </head>
+
     <body style="
         background:#111;
         color:white;
@@ -95,11 +105,16 @@ def home():
         text-align:center;
         padding-top:50px;
     ">
+
         <h1>👑 KING OF XAU_NAS — GOLD</h1>
+
         <h2>🟢 BOT ONLINE</h2>
-        <p>XAU/USD</p>
-        <p>15 Minute Analysis</p>
-        <p>Advanced Confirmation Engine</p>
+
+        <p>🟡 XAU/USD</p>
+        <p>⏱ 15 Minute Analysis</p>
+        <p>🧠 Advanced Confirmation Engine</p>
+        <p>🤖 Automatic Scanner</p>
+
     </body>
     </html>
     """
@@ -109,111 +124,186 @@ def home():
 def health():
     return {
         "status": "online",
-        "market": "XAU/USD",
+        "bot": BOT_NAME,
+        "market": XAU_SYMBOL,
         "timeframe": INTERVAL,
         "scanner": scanner_running,
     }
 
 
 def run_flask():
+    """
+    Render requires the application to listen on $PORT.
+    """
+
     try:
+
+        logger.info(
+            f"🌐 Starting Flask on port {PORT}"
+        )
+
         app.run(
             host="0.0.0.0",
             port=PORT,
             debug=False,
             use_reloader=False,
         )
+
     except Exception as e:
-        logger.error(f"Flask error: {e}")
+
+        logger.exception(
+            f"Flask error: {e}"
+        )
 
 
 # ============================================================
-# CHAT ID
+# CHAT ID STORAGE
 # ============================================================
 
 def load_chat_id():
+
+    global TELEGRAM_CHAT_ID
+
+    # First use runtime value
+    if TELEGRAM_CHAT_ID:
+
+        return str(
+            TELEGRAM_CHAT_ID
+        )
+
     try:
-        if not os.path.exists(CHAT_ID_FILE):
+
+        if not os.path.exists(
+            CHAT_ID_FILE
+        ):
+
             return None
 
         with open(
             CHAT_ID_FILE,
             "r",
             encoding="utf-8",
-        ) as f:
-            data = json.load(f)
+        ) as file:
 
-        chat_id = data.get("chat_id")
+            data = json.load(file)
+
+        chat_id = data.get(
+            "chat_id"
+        )
 
         if chat_id:
-            return str(chat_id)
+
+            TELEGRAM_CHAT_ID = str(
+                chat_id
+            )
+
+            logger.info(
+                f"🆔 Chat ID loaded: "
+                f"{TELEGRAM_CHAT_ID}"
+            )
+
+            return TELEGRAM_CHAT_ID
 
     except Exception as e:
-        logger.error(f"Chat ID load error: {e}")
+
+        logger.error(
+            f"Chat ID load error: {e}"
+        )
 
     return None
 
 
 def save_chat_id(chat_id):
+
+    global TELEGRAM_CHAT_ID
+
     try:
-        with chat_id_lock:
-            with open(
-                CHAT_ID_FILE,
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(
-                    {
-                        "chat_id": str(chat_id),
-                        "saved_at": datetime.now(
+
+        TELEGRAM_CHAT_ID = str(
+            chat_id
+        )
+
+        with open(
+            CHAT_ID_FILE,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                {
+                    "chat_id":
+                        TELEGRAM_CHAT_ID,
+                    "saved_at":
+                        datetime.now(
                             timezone.utc
                         ).isoformat(),
-                    },
-                    f,
-                    indent=4,
-                )
+                },
+                file,
+                indent=4,
+            )
 
         logger.info(
-            f"Telegram Chat ID saved: {chat_id}"
+            f"🆔 Telegram Chat ID saved: "
+            f"{TELEGRAM_CHAT_ID}"
         )
 
         return True
 
     except Exception as e:
+
         logger.error(
             f"Chat ID save error: {e}"
         )
 
-        return False
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-async def send_message(message):
-    chat_id = load_chat_id()
-
-    if not chat_id:
-        logger.warning(
-            "No Telegram Chat ID. "
-            "Send /start first."
-        )
-        return False
-
-    if telegram_application is None:
-        return False
-
-    try:
-        await telegram_application.bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode="Markdown",
+        # Runtime ID is still retained
+        TELEGRAM_CHAT_ID = str(
+            chat_id
         )
 
         return True
 
+
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
+
+async def send_message(
+    message,
+    context=None,
+):
+
+    chat_id = load_chat_id()
+
+    if not chat_id:
+
+        logger.warning(
+            "⚠️ No Telegram Chat ID."
+        )
+
+        return False
+
+    try:
+
+        if context is not None:
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode="Markdown",
+            )
+
+        else:
+
+            logger.warning(
+                "Telegram context unavailable."
+            )
+
+            return False
+
+        return True
+
     except Exception as e:
+
         logger.error(
             f"Telegram send error: {e}"
         )
@@ -231,46 +321,63 @@ async def start_command(
 ):
 
     if not update.effective_chat:
+
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = (
+        update.effective_chat.id
+    )
 
     username = "Telegram User"
 
     if update.effective_user:
+
         if update.effective_user.username:
+
             username = (
                 "@"
                 + update.effective_user.username
             )
 
-    saved = save_chat_id(chat_id)
+        elif update.effective_user.first_name:
 
-    if saved:
+            username = (
+                update.effective_user.first_name
+            )
 
-        message = (
-            "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
-            "🟢 *BOT CONNECTED*\n\n"
-            f"👤 User: {username}\n"
-            f"🆔 Chat ID: `{chat_id}`\n\n"
-            "✅ Chat ID automatically detected "
-            "and saved.\n\n"
-            "🟡 Market: XAU/USD\n"
-            "⏱ Timeframe: 15 Minutes\n"
-            "🤖 Automatic Scanner: ON\n"
-            "🧠 Confirmation Engine: ON\n\n"
-            "Use /scan for a live scan.\n"
-            "Use /status for system status."
-        )
+    # Automatically capture Chat ID
+    save_chat_id(chat_id)
 
-    else:
+    message = (
+        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
 
-        message = (
-            "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
-            "⚠️ Chat ID detected but could "
-            "not be saved.\n\n"
-            f"🆔 Chat ID: `{chat_id}`"
-        )
+        "🟢 *BOT CONNECTED*\n\n"
+
+        f"👤 User: {username}\n"
+        f"🆔 Chat ID: `{chat_id}`\n\n"
+
+        "✅ *Chat ID automatically detected.*\n"
+        "✅ *Telegram alerts are now enabled.*\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟡 *MARKET*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Market: *XAU/USD*\n"
+        "Timeframe: *15 Minutes*\n"
+        "Automatic Scanner: *ON*\n"
+        "Confirmation Engine: *ON*\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📱 *COMMANDS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "/scan — Live GOLD scan\n"
+        "/status — System status\n"
+        "/start — Register Chat ID\n\n"
+
+        "👑 *KING OF XAU_NAS IS READY.*"
+    )
 
     await update.message.reply_text(
         message,
@@ -309,29 +416,38 @@ async def status_command(
 
     message = (
         "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚙️ *SYSTEM STATUS*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+
         f"Telegram: {telegram_status}\n"
         f"Twelve Data: {data_status}\n"
-        f"Scanner: {scanner_status}\n"
-        "Market: 🟡 XAU/USD\n"
-        "Timeframe: 15min\n\n"
+        f"Scanner: {scanner_status}\n\n"
+
+        "🟡 Market: XAU/USD\n"
+        "⏱ Timeframe: 15min\n\n"
+
         "🧠 Confirmation Engine: ON\n"
         "🚀 Breakout Detection: ON\n"
         "🔄 Pullback Detection: ON\n"
         "⚡ Reversal Detection: ON\n"
         "🛡️ RSI Protection: ON\n"
         "🛡️ ATR Protection: ON\n"
+        "🤖 Automatic Scanner: ON\n"
     )
 
     if chat_id:
+
         message += (
             f"\n🆔 Chat ID: `{chat_id}`"
         )
+
     else:
+
         message += (
-            "\nSend /start to register your Chat ID."
+            "\n\n⚠️ Send /start to "
+            "register your Chat ID."
         )
 
     await update.message.reply_text(
@@ -347,9 +463,11 @@ async def status_command(
 def get_gold_data():
 
     if not TWELVE_DATA_API_KEY:
+
         logger.error(
             "TWELVE_DATA_API_KEY missing."
         )
+
         return None
 
     url = (
@@ -374,22 +492,28 @@ def get_gold_data():
         )
 
         if response.status_code != 200:
+
             logger.error(
                 f"Twelve Data HTTP "
                 f"{response.status_code}"
             )
+
             return None
 
         data = response.json()
 
         if "values" not in data:
+
             logger.error(
                 f"Twelve Data error: {data}"
             )
+
             return None
 
         values = list(
-            reversed(data["values"])
+            reversed(
+                data["values"]
+            )
         )
 
         candles = []
@@ -400,21 +524,33 @@ def get_gold_data():
 
                 candles.append(
                     {
-                        "datetime": item["datetime"],
-                        "open": float(item["open"]),
-                        "high": float(item["high"]),
-                        "low": float(item["low"]),
-                        "close": float(item["close"]),
+                        "datetime":
+                            item["datetime"],
+
+                        "open":
+                            float(item["open"]),
+
+                        "high":
+                            float(item["high"]),
+
+                        "low":
+                            float(item["low"]),
+
+                        "close":
+                            float(item["close"]),
                     }
                 )
 
             except Exception:
+
                 continue
 
         if len(candles) < 60:
+
             logger.error(
-                "Not enough candles."
+                "Not enough GOLD candles."
             )
+
             return None
 
         return candles
@@ -432,20 +568,30 @@ def get_gold_data():
 # EMA
 # ============================================================
 
-def calculate_ema(values, period):
+def calculate_ema(
+    values,
+    period,
+):
 
     if len(values) < period:
+
         return None
 
-    multiplier = 2 / (period + 1)
+    multiplier = (
+        2 / (period + 1)
+    )
 
-    ema = sum(
-        values[:period]
-    ) / period
+    ema = (
+        sum(values[:period])
+        / period
+    )
 
     for price in values[period:]:
+
         ema = (
-            (price - ema)
+            (
+                price - ema
+            )
             * multiplier
         ) + ema
 
@@ -456,15 +602,22 @@ def calculate_ema(values, period):
 # RSI
 # ============================================================
 
-def calculate_rsi(values, period=14):
+def calculate_rsi(
+    values,
+    period=14,
+):
 
     if len(values) < period + 1:
+
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
+    for i in range(
+        1,
+        len(values),
+    ):
 
         change = (
             values[i]
@@ -515,9 +668,13 @@ def calculate_rsi(values, period=14):
         ) / period
 
     if avg_loss == 0:
+
         return 100.0
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
     return 100 - (
         100 / (1 + rs)
@@ -534,6 +691,7 @@ def calculate_atr(
 ):
 
     if len(candles) < period + 1:
+
         return None
 
     true_ranges = []
@@ -590,6 +748,7 @@ def calculate_atr(
 def get_momentum(candles):
 
     if len(candles) < 5:
+
         return "NEUTRAL"
 
     current = candles[-1]
@@ -606,6 +765,7 @@ def get_momentum(candles):
     )
 
     if candle_range <= 0:
+
         return "NEUTRAL"
 
     body_ratio = (
@@ -619,6 +779,7 @@ def get_momentum(candles):
         > previous["close"]
         and body_ratio >= 0.50
     ):
+
         return "BULLISH"
 
     if (
@@ -628,6 +789,7 @@ def get_momentum(candles):
         < previous["close"]
         and body_ratio >= 0.50
     ):
+
         return "BEARISH"
 
     return "NEUTRAL"
@@ -640,18 +802,18 @@ def get_momentum(candles):
 def analyze_gold(candles):
 
     closes = [
-        x["close"]
-        for x in candles
+        candle["close"]
+        for candle in candles
     ]
 
     highs = [
-        x["high"]
-        for x in candles
+        candle["high"]
+        for candle in candles
     ]
 
     lows = [
-        x["low"]
-        for x in candles
+        candle["low"]
+        for candle in candles
     ]
 
     price = closes[-1]
@@ -681,18 +843,19 @@ def analyze_gold(candles):
     )
 
     if any(
-        x is None
-        for x in (
+        value is None
+        for value in (
             ema20,
             ema50,
             rsi,
             atr,
         )
     ):
+
         return None
 
     # ========================================================
-    # MARKET TREND
+    # TREND
     # ========================================================
 
     bullish_trend = (
@@ -742,7 +905,7 @@ def analyze_gold(candles):
     )
 
     # ========================================================
-    # EMA DISTANCE
+    # ATR DISTANCE
     # ========================================================
 
     atr_distance = (
@@ -778,7 +941,7 @@ def analyze_gold(candles):
     )
 
     # ========================================================
-    # RSI STATES
+    # RSI
     # ========================================================
 
     bullish_rsi = (
@@ -798,7 +961,7 @@ def analyze_gold(candles):
     )
 
     # ========================================================
-    # REVERSAL CONFIRMATION
+    # REVERSAL
     # ========================================================
 
     recent = candles[-3:]
@@ -866,10 +1029,6 @@ def analyze_gold(candles):
     conditions = []
     failed = []
 
-    # ========================================================
-    # BULLISH PULLBACK
-    # ========================================================
-
     if bullish_trend:
 
         conditions.append(
@@ -911,10 +1070,6 @@ def analyze_gold(candles):
             failed.append(
                 "Bullish momentum missing"
             )
-
-    # ========================================================
-    # BEARISH PULLBACK
-    # ========================================================
 
     if bearish_trend:
 
@@ -1047,7 +1202,7 @@ def analyze_gold(candles):
         ]
 
     # ========================================================
-    # DETERMINE CONFIRMATION
+    # CONFIRMATION
     # ========================================================
 
     confirmed = False
@@ -1130,33 +1285,28 @@ def analyze_gold(candles):
     ) * 100
 
     if confirmed:
+
         confidence = max(
             confidence,
             80,
         )
 
     # ========================================================
-    # TRADE DIRECTION
+    # DIRECTION
     # ========================================================
 
-    if (
-        setup_type in
-        (
-            "BREAKOUT BUY",
-            "BULLISH PULLBACK",
-            "REVERSAL BUY",
-        )
+    if setup_type in (
+        "BREAKOUT BUY",
+        "BULLISH PULLBACK",
+        "REVERSAL BUY",
     ):
 
         direction = "BUY"
 
-    elif (
-        setup_type in
-        (
-            "BREAKOUT SELL",
-            "BEARISH PULLBACK",
-            "REVERSAL SELL",
-        )
+    elif setup_type in (
+        "BREAKOUT SELL",
+        "BEARISH PULLBACK",
+        "REVERSAL SELL",
     ):
 
         direction = "SELL"
@@ -1256,14 +1406,13 @@ def analyze_gold(candles):
     else:
 
         entry = price
+
         stop_loss = None
         tp1 = None
         tp2 = None
         tp3 = None
 
-        pending_type = (
-            "WATCH PULLBACK"
-        )
+        pending_type = "WATCH PULLBACK"
 
         if bullish_trend:
 
@@ -1306,13 +1455,15 @@ def analyze_gold(candles):
         "tp3": tp3,
         "pending_type": pending_type,
         "pending_entry": pending_entry,
-        "bullish_pullback_zone": bullish_pullback_zone,
-        "bearish_pullback_zone": bearish_pullback_zone,
+        "bullish_pullback_zone":
+            bullish_pullback_zone,
+        "bearish_pullback_zone":
+            bearish_pullback_zone,
     }
 
 
 # ============================================================
-# FORMAT MESSAGE
+# FORMAT SIGNAL
 # ============================================================
 
 def format_signal(a):
@@ -1323,16 +1474,19 @@ def format_signal(a):
     if stage == "CONFIRMED":
 
         if direction == "BUY":
+
             header = (
                 "🚨 *SIGNAL CONFIRMED — BUY* 🚨"
             )
 
         elif direction == "SELL":
+
             header = (
                 "🚨 *SIGNAL CONFIRMED — SELL* 🚨"
             )
 
         else:
+
             header = (
                 "🚨 *SIGNAL CONFIRMED* 🚨"
             )
@@ -1357,26 +1511,37 @@ def format_signal(a):
 
     message = (
         "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+
         "🟡 *XAU/USD*\n"
+
         "━━━━━━━━━━━━━━━━━━━━\n"
+
         f"{header}\n"
+
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+
         f"📌 Setup: *{a['setup_type']}*\n"
         f"🎯 Stage: *{stage}*\n"
         f"📊 Direction: *{direction}*\n"
         f"💯 Confidence: "
         f"*{a['confidence']:.0f}%*\n\n"
+
         f"💰 Price: "
         f"`${a['price']:,.2f}`\n"
+
         f"📈 Trend: *{a['trend']}*\n"
+
         f"⚡ Momentum: *{a['momentum']}*\n\n"
+
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *TECHNICAL ANALYSIS*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+
         f"EMA 20: `{a['ema20']:,.2f}`\n"
         f"EMA 50: `{a['ema50']:,.2f}`\n"
         f"RSI 14: `{a['rsi']:.1f}`\n"
         f"ATR 14: `{a['atr']:.2f}`\n"
+
         f"EMA Distance: "
         f"`{a['atr_distance']:.2f} ATR`\n\n"
     )
@@ -1403,23 +1568,30 @@ def format_signal(a):
             "\n━━━━━━━━━━━━━━━━━━━━\n"
             "🎯 *TRADE LEVELS*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
+
             f"💰 Entry: "
             f"`${a['entry']:,.2f}`\n"
+
             f"🛑 SL: "
             f"`${a['stop_loss']:,.2f}`\n"
+
             f"🥇 TP1: "
             f"`${a['tp1']:,.2f}`\n"
+
             f"🥈 TP2: "
             f"`${a['tp2']:,.2f}`\n"
+
             f"🏆 TP3: "
             f"`${a['tp3']:,.2f}`\n\n"
+
             "⏳ *PENDING ORDER IDEA*\n"
+
             f"{a['pending_type']}: "
             f"`{a['pending_entry']:,.2f}`\n\n"
         )
 
     # ========================================================
-    # NEAR / FORMING
+    # FORMING
     # ========================================================
 
     elif stage in (
@@ -1460,6 +1632,7 @@ def format_signal(a):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🟡 *ACTION: WAIT*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
+
             "🚫 Do not chase the current price.\n"
             "Wait for confirmation.\n\n"
         )
@@ -1483,6 +1656,7 @@ def format_signal(a):
 
         message += (
             "🔄 *BULLISH PULLBACK ZONE*\n"
+
             f"`{zone[0]:,.2f}` → "
             f"`{zone[1]:,.2f}`\n\n"
         )
@@ -1495,6 +1669,7 @@ def format_signal(a):
 
         message += (
             "🔄 *BEARISH PULLBACK ZONE*\n"
+
             f"`{zone[0]:,.2f}` → "
             f"`{zone[1]:,.2f}`\n\n"
         )
@@ -1507,6 +1682,7 @@ def format_signal(a):
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚙️ *SYSTEM*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+
         "⏱ Timeframe: *15min*\n"
         "📡 Data: *Twelve Data*\n"
         "🧠 Confirmation Engine: *ON*\n"
@@ -1516,6 +1692,7 @@ def format_signal(a):
         "🛡️ RSI Protection: *ON*\n"
         "🛡️ ATR Protection: *ON*\n"
         "🤖 Automatic Scanner: *ON*\n\n"
+
         "⚠️ Market information is for analysis only.\n"
         "Not financial advice. Manage risk carefully."
     )
@@ -1524,7 +1701,7 @@ def format_signal(a):
 
 
 # ============================================================
-# SCAN
+# SCAN GOLD
 # ============================================================
 
 def scan_gold():
@@ -1536,6 +1713,7 @@ def scan_gold():
     candles = get_gold_data()
 
     if not candles:
+
         return None
 
     analysis = analyze_gold(
@@ -1543,6 +1721,7 @@ def scan_gold():
     )
 
     if not analysis:
+
         return None
 
     logger.info(
@@ -1583,6 +1762,13 @@ async def scan_command(
 
         return
 
+    # Register Chat ID when user uses /scan too
+    if update.effective_chat:
+
+        save_chat_id(
+            update.effective_chat.id
+        )
+
     await update.message.reply_text(
         format_signal(analysis),
         parse_mode="Markdown",
@@ -1590,16 +1776,18 @@ async def scan_command(
 
 
 # ============================================================
-# AUTOMATIC ALERT ENGINE
+# AUTOMATIC SCANNER
 # ============================================================
 
-async def automatic_scanner():
+async def automatic_scanner(
+    application: Application,
+):
 
     global scanner_running
     global last_confirmed_key
-    global last_alert_time
-    global last_stage
+    global last_confirmed_time
     global last_setup_key
+    global last_setup_stage
 
     scanner_running = True
 
@@ -1607,215 +1795,237 @@ async def automatic_scanner():
         "🟢 Advanced automatic scanner started."
     )
 
-    while True:
+    try:
 
-        try:
+        while True:
 
-            analysis = await asyncio.to_thread(
-                scan_gold
-            )
+            try:
 
-            if analysis:
-
-                stage = analysis[
-                    "stage"
-                ]
-
-                setup = analysis[
-                    "setup_type"
-                ]
-
-                direction = analysis[
-                    "direction"
-                ]
-
-                price = analysis[
-                    "price"
-                ]
-
-                # ==================================================
-                # UNIQUE SETUP
-                # ==================================================
-
-                price_zone = round(
-                    price,
-                    1,
+                analysis = await asyncio.to_thread(
+                    scan_gold
                 )
 
-                setup_key = (
-                    f"{setup}_"
-                    f"{direction}_"
-                    f"{price_zone}"
-                )
+                if analysis:
 
-                # ==================================================
-                # CONFIRMED ALERT
-                # ==================================================
+                    stage = analysis[
+                        "stage"
+                    ]
 
-                if (
-                    analysis["confirmed"]
-                    and stage == "CONFIRMED"
-                ):
+                    setup = analysis[
+                        "setup_type"
+                    ]
 
-                    confirmed_key = (
-                        f"{setup}_"
-                        f"{direction}_"
-                        f"{round(price, 1)}"
+                    direction = analysis[
+                        "direction"
+                    ]
+
+                    price = analysis[
+                        "price"
+                    ]
+
+                    price_zone = round(
+                        price,
+                        1,
                     )
 
-                    now = time.time()
+                    setup_key = (
+                        f"{setup}_"
+                        f"{direction}_"
+                        f"{price_zone}"
+                    )
 
-                    # New confirmation OR
-                    # more than 30 minutes since
-                    # the previous identical alert.
+                    # ==================================================
+                    # CONFIRMED SIGNAL
+                    # ==================================================
+
                     if (
-                        confirmed_key
-                        != last_confirmed_key
-                        or
-                        now
-                        - last_alert_time
-                        >= 1800
+                        analysis["confirmed"]
+                        and stage == "CONFIRMED"
                     ):
 
-                        message = format_signal(
-                            analysis
+                        confirmed_key = (
+                            f"{setup}_"
+                            f"{direction}_"
+                            f"{round(price, 1)}"
                         )
 
-                        sent = await send_message(
-                            message
+                        now = time.time()
+
+                        should_send = (
+                            confirmed_key
+                            != last_confirmed_key
+                            or
+                            now
+                            - last_confirmed_time
+                            >= 1800
                         )
 
-                        if sent:
+                        if should_send:
 
-                            last_confirmed_key = (
-                                confirmed_key
+                            message = format_signal(
+                                analysis
                             )
 
-                            last_alert_time = now
-
-                            logger.info(
-                                "🚨 CONFIRMED "
-                                "SIGNAL SENT."
+                            sent = await send_message(
+                                message,
+                                application,
                             )
 
-                # ==================================================
-                # SETUP FORMING / NEAR CONFIRMATION
-                # ==================================================
+                            if sent:
 
-                elif stage in (
-                    "SETUP FORMING",
-                    "NEAR CONFIRMATION",
-                ):
+                                last_confirmed_key = (
+                                    confirmed_key
+                                )
 
-                    # Only notify when the setup stage
-                    # changes. This prevents spam every
-                    # five minutes.
-                    if (
-                        setup_key
-                        != last_setup_key
-                        or
-                        stage
-                        != last_stage
+                                last_confirmed_time = (
+                                    now
+                                )
+
+                                logger.info(
+                                    "🚨 CONFIRMED "
+                                    "SIGNAL SENT."
+                                )
+
+                    # ==================================================
+                    # FORMING SETUP
+                    # ==================================================
+
+                    elif stage in (
+                        "SETUP FORMING",
+                        "NEAR CONFIRMATION",
                     ):
 
-                        message = format_signal(
-                            analysis
-                        )
+                        if (
+                            setup_key
+                            != last_setup_key
+                            or
+                            stage
+                            != last_setup_stage
+                        ):
 
-                        sent = await send_message(
-                            message
-                        )
-
-                        if sent:
-
-                            last_setup_key = (
-                                setup_key
+                            message = format_signal(
+                                analysis
                             )
 
-                            last_stage = (
-                                stage
+                            sent = await send_message(
+                                message,
+                                application,
                             )
 
-                            logger.info(
-                                f"🟠 {stage} "
-                                "notification sent."
-                            )
+                            if sent:
 
-                else:
+                                last_setup_key = (
+                                    setup_key
+                                )
 
-                    # Keep the current state updated.
-                    last_stage = stage
+                                last_setup_stage = (
+                                    stage
+                                )
 
-        except Exception as e:
+                                logger.info(
+                                    f"🟠 {stage} "
+                                    "notification sent."
+                                )
 
-            logger.exception(
-                f"Automatic scanner error: {e}"
-            )
+                    else:
 
-        await asyncio.sleep(
-            SCAN_INTERVAL_SECONDS
+                        last_setup_stage = stage
+
+                # Wait until next scan
+                await asyncio.sleep(
+                    SCAN_INTERVAL_SECONDS
+                )
+
+            except asyncio.CancelledError:
+
+                logger.info(
+                    "🛑 Automatic scanner "
+                    "cancelled."
+                )
+
+                raise
+
+            except Exception as e:
+
+                logger.exception(
+                    f"Automatic scanner error: {e}"
+                )
+
+                await asyncio.sleep(
+                    30
+                )
+
+    finally:
+
+        scanner_running = False
+
+        logger.info(
+            "🔴 Automatic scanner stopped."
         )
 
 
 # ============================================================
-# START SCANNER THREAD
-# ============================================================
-
-def start_scanner_thread():
-
-    def runner():
-
-        try:
-
-            asyncio.run(
-                automatic_scanner()
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                f"Scanner stopped: {e}"
-            )
-
-    thread = Thread(
-        target=runner,
-        daemon=True,
-    )
-
-    thread.start()
-
-    logger.info(
-        "🟢 Automatic scanner thread launched."
-    )
-
-
-# ============================================================
-# TELEGRAM INIT
+# POST INIT
 # ============================================================
 
 async def post_init(
     application: Application,
 ):
 
-    global telegram_application
-
-    telegram_application = application
-
     chat_id = load_chat_id()
 
     if chat_id:
 
         logger.info(
-            "Saved Telegram Chat ID loaded."
+            f"🆔 Saved Chat ID available: "
+            f"{chat_id}"
         )
 
     else:
 
         logger.warning(
-            "No Chat ID saved. "
-            "Send /start."
+            "⚠️ No Chat ID saved. "
+            "Send /start in Telegram."
         )
 
+    # Start automatic scanner INSIDE
+    # Telegram's event loop.
+    application.create_task(
+        automatic_scanner(
+            application
+        ),
+        name="gold_automatic_scanner",
+    )
+
+    logger.info(
+        "🟢 Automatic scanner task created."
+    )
+
+
+# ============================================================
+# POST SHUTDOWN
+# ============================================================
+
+async def post_shutdown(
+    application: Application,
+):
+
+    logger.info(
+        "🛑 Telegram application shutting down."
+    )
+
+    global scanner_running
+
+    scanner_running = False
+
+    logger.info(
+        "🛑 KING OF XAU_NAS shutdown complete."
+    )
+
+
+# ============================================================
+# CREATE TELEGRAM APPLICATION
+# ============================================================
 
 def create_application():
 
@@ -1832,6 +2042,9 @@ def create_application():
         )
         .post_init(
             post_init
+        )
+        .post_shutdown(
+            post_shutdown
         )
         .build()
     )
@@ -1865,8 +2078,6 @@ def create_application():
 # ============================================================
 
 def main():
-
-    global telegram_application
 
     logger.info(
         "========================================"
@@ -1908,6 +2119,10 @@ def main():
         "========================================"
     )
 
+    # ========================================================
+    # ENVIRONMENT CHECK
+    # ========================================================
+
     if not TELEGRAM_BOT_TOKEN:
 
         logger.error(
@@ -1928,28 +2143,44 @@ def main():
     # FLASK
     # ========================================================
 
-    Thread(
-        target=run_flask,
-        daemon=True,
-    ).start()
+    try:
 
-    logger.info(
-        "🟢 Flask server started."
-    )
+        flask_thread = __import__(
+            "threading"
+        ).Thread(
+            target=run_flask,
+            daemon=True,
+            name="flask_server",
+        )
+
+        flask_thread.start()
+
+        logger.info(
+            f"🟢 Flask server launched "
+            f"on port {PORT}."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Flask startup error: {e}"
+        )
+
+        return
 
     # ========================================================
     # TELEGRAM
     # ========================================================
 
-    telegram_application = (
-        create_application()
+    application = create_application()
+
+    logger.info(
+        "🟢 Telegram application created."
     )
 
     # ========================================================
-    # SCANNER
+    # ONLINE
     # ========================================================
-
-    start_scanner_thread()
 
     logger.info(
         "========================================"
@@ -1972,10 +2203,18 @@ def main():
     )
 
     logger.info(
+        "🤖 Automatic scanner: ONLINE"
+    )
+
+    logger.info(
         "========================================"
     )
 
-    telegram_application.run_polling(
+    # ========================================================
+    # RUN TELEGRAM
+    # ========================================================
+
+    application.run_polling(
         drop_pending_updates=True
     )
 
@@ -1985,4 +2224,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
