@@ -1,85 +1,73 @@
 import os
-import json
-import time
 import asyncio
 import logging
-from threading import Thread
+import threading
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
 
-# ============================================================
-# 👑 KING OF XAU_NAS — INSTITUTIONAL GOLD TELEGRAM ENGINE
-# ============================================================
-#
-# TELEGRAM SIGNAL ENGINE
-# XAU/USD ONLY
-#
-# Includes:
-# 1H + 15M + 5M confirmation
-# EMA20 / EMA50
-# RSI14
-# ATR14
-# Break of Structure
-# Liquidity sweep
-# Fair Value Gap
-# Candle confirmation
-# Automatic scanner
-# BUY / SELL signals
-# BUY STOP / SELL STOP alerts
-# BUY LIMIT / SELL LIMIT alerts
-# TP1 / TP2 / TP3
-# Break-even
-# Dynamic trailing protection
-# Trade tracking
-# Performance
-#
-# IMPORTANT:
-# This bot DOES NOT place broker orders.
-# It only sends signals/alerts through Telegram.
-# ============================================================
-
 
 # ============================================================
-# SETTINGS
+# 👑 KING OF XAU_NAS — INSTITUTIONAL GOLD TELEGRAM AI
+# ============================================================
+
+BOT_NAME = "👑 KING OF XAU_NAS — GOLD"
+
+# ============================================================
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-CHAT_ID = os.getenv("CHAT_ID")
+
+# Optional:
+# Put your Telegram chat ID in Render if you want the bot
+# to automatically send signals to one specific chat.
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 PORT = int(os.getenv("PORT", "10000"))
 
+
+# ============================================================
+# MARKET SETTINGS
+# ============================================================
+
 XAU_SYMBOL = "XAU/USD"
 
-MAIN_INTERVAL = "15min"
-HTF_INTERVAL = "1h"
-ENTRY_INTERVAL = "5min"
+INTERVAL = "15min"
+OUTPUT_SIZE = 120
 
-OUTPUT_SIZE = 100
+SCAN_SECONDS = 60
 
-# Automatic scanner
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "300"))
+# Signal quality
+MIN_CONFIDENCE = 70
 
-# Trade monitoring
-MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "15"))
+# ATR multipliers
+SL_ATR_MULTIPLIER = 1.5
 
-# Minimum score for signal
-SIGNAL_SCORE = 8
+TP1_ATR_MULTIPLIER = 1.5
+TP2_ATR_MULTIPLIER = 2.5
+TP3_ATR_MULTIPLIER = 4.0
 
-# Minimum signal strength
-MIN_CONFIDENCE = 82
 
-# Local trade database
-TRADES_FILE = "trades.json"
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+last_signal_key = None
+
+active_trade = None
+
+bot_application = None
+
+stop_event = threading.Event()
 
 
 # ============================================================
@@ -91,277 +79,202 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger("KING_OF_XAU_NAS")
+logger = logging.getLogger(BOT_NAME)
 
 
 # ============================================================
-# WEB SERVER FOR RENDER
+# FLASK SERVER
 # ============================================================
 
-web_app = Flask(__name__)
+app = Flask(__name__)
 
 
-@web_app.route("/")
+@app.route("/")
 def home():
-    return "KING OF XAU_NAS Institutional Gold Engine is running!"
+    return "KING OF XAU_NAS — GOLD BOT ONLINE 👑", 200
 
 
-@web_app.route("/health")
+@app.route("/health")
 def health():
-    return "OK"
+    return {
+        "status": "online",
+        "bot": BOT_NAME,
+        "symbol": XAU_SYMBOL,
+        "timeframe": INTERVAL,
+    }, 200
 
 
-def run_web_server():
-
-    web_app.run(
+def run_flask():
+    app.run(
         host="0.0.0.0",
-        port=PORT
+        port=PORT,
+        debug=False,
+        use_reloader=False,
     )
 
 
 # ============================================================
-# TRADE MEMORY
+# TELEGRAM MESSAGE
 # ============================================================
 
-def load_trades():
-
-    try:
-
-        with open(
-            TRADES_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-            if isinstance(data, list):
-                return data
-
-    except Exception:
-        pass
-
-    return []
-
-
-open_trades = load_trades()
-
-last_signal_key = None
-last_scanned_candle = None
-
-scanner_enabled = True
-
-
-def save_trades():
-
-    try:
-
-        temporary_file = TRADES_FILE + ".tmp"
-
-        with open(
-            temporary_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                open_trades,
-                file,
-                indent=4
-            )
-
-        os.replace(
-            temporary_file,
-            TRADES_FILE
-        )
-
-    except Exception as error:
-
-        logger.error(
-            "Trade database error: %s",
-            error
-        )
-
-
-# ============================================================
-# TWELVE DATA REQUEST
-# ============================================================
-
-def twelve_data_request(
-    endpoint,
-    params
+async def send_chat_message(
+    context,
+    message,
+    chat_id=None,
 ):
+    """
+    Send Telegram message.
+
+    If chat_id is supplied, send there.
+    Otherwise use TELEGRAM_CHAT_ID.
+    """
+
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+
+    if not target_chat_id:
+        logger.warning(
+            "No TELEGRAM_CHAT_ID configured."
+        )
+        return False
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=message,
+            parse_mode="Markdown",
+        )
+
+        return True
+
+    except Exception as e:
+        logger.error(
+            "Telegram send error: %s",
+            e,
+        )
+
+        return False
+
+
+# ============================================================
+# TWELVE DATA
+# ============================================================
+
+def get_gold_data():
+    """
+    Download XAU/USD candles from Twelve Data.
+    """
 
     if not TWELVE_DATA_API_KEY:
+        logger.error(
+            "TWELVE_DATA_API_KEY is missing."
+        )
+        return None
 
-        return None, "Twelve Data API key is missing."
+    url = "https://api.twelvedata.com/time_series"
 
-    request_params = dict(params)
-
-    request_params["apikey"] = TWELVE_DATA_API_KEY
-
-    url = (
-        "https://api.twelvedata.com/"
-        + endpoint
-    )
+    params = {
+        "symbol": XAU_SYMBOL,
+        "interval": INTERVAL,
+        "outputsize": OUTPUT_SIZE,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+    }
 
     try:
 
         response = requests.get(
             url,
-            params=request_params,
-            timeout=15
+            params=params,
+            timeout=20,
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-        if data.get("status") == "error":
-
-            return None, data.get(
-                "message",
-                "Twelve Data returned an error."
-            )
-
-        return data, None
-
-    except Exception as error:
-
-        logger.error(
-            "Twelve Data error: %s",
-            error
-        )
-
-        return None, (
-            "Unable to connect to Twelve Data."
-        )
-
-
-# ============================================================
-# PRICE
-# ============================================================
-
-def get_price():
-
-    data, error = twelve_data_request(
-        "price",
-        {
-            "symbol": XAU_SYMBOL
-        }
-    )
-
-    if error:
-        return None, error
-
-    try:
-
-        return float(
-            data["price"]
-        ), None
-
-    except Exception:
-
-        return None, (
-            "No valid GOLD price returned."
-        )
-
-
-# ============================================================
-# CANDLES
-# ============================================================
-
-def get_candles(
-    interval=MAIN_INTERVAL,
-    outputsize=OUTPUT_SIZE
-):
-
-    data, error = twelve_data_request(
-        "time_series",
-        {
-            "symbol": XAU_SYMBOL,
-            "interval": interval,
-            "outputsize": outputsize,
-            "format": "JSON"
-        }
-    )
-
-    if error:
-        return None, error
-
-    try:
+        if "status" in data:
+            if data["status"] == "error":
+                logger.error(
+                    "Twelve Data error: %s",
+                    data.get("message"),
+                )
+                return None
 
         values = data.get("values")
 
         if not values:
-
-            return None, (
-                "No candle data returned."
+            logger.error(
+                "No XAU/USD data returned."
             )
+            return None
+
+        # Twelve Data returns newest first.
+        values = list(reversed(values))
 
         candles = []
 
-        for candle in reversed(values):
+        for candle in values:
 
-            candles.append(
-                {
-                    "datetime": candle.get(
-                        "datetime"
-                    ),
-                    "open": float(
-                        candle["open"]
-                    ),
-                    "high": float(
-                        candle["high"]
-                    ),
-                    "low": float(
-                        candle["low"]
-                    ),
-                    "close": float(
-                        candle["close"]
-                    )
-                }
+            try:
+
+                candles.append(
+                    {
+                        "datetime": candle["datetime"],
+                        "open": float(candle["open"]),
+                        "high": float(candle["high"]),
+                        "low": float(candle["low"]),
+                        "close": float(candle["close"]),
+                    }
+                )
+
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        if len(candles) < 60:
+            logger.warning(
+                "Not enough candles: %s",
+                len(candles),
             )
+            return None
 
-        return candles, None
+        return candles
 
-    except Exception as error:
+    except requests.RequestException as e:
 
         logger.error(
-            "Candle processing error: %s",
-            error
+            "Market data request failed: %s",
+            e,
         )
 
-        return None, (
-            "Unable to process candle data."
+        return None
+
+    except Exception as e:
+
+        logger.exception(
+            "Unexpected market data error: %s",
+            e,
         )
+
+        return None
 
 
 # ============================================================
 # EMA
 # ============================================================
 
-def calculate_ema(
-    values,
-    period
-):
+def calculate_ema(values, period):
 
     if len(values) < period:
         return None
 
-    multiplier = (
-        2 / (period + 1)
-    )
+    multiplier = 2 / (period + 1)
 
-    ema = sum(
-        values[:period]
-    ) / period
+    ema = sum(values[:period]) / period
 
     for price in values[period:]:
 
         ema = (
-            (price - ema)
-            * multiplier
+            (price - ema) * multiplier
         ) + ema
 
     return ema
@@ -371,84 +284,56 @@ def calculate_ema(
 # RSI
 # ============================================================
 
-def calculate_rsi(
-    values,
-    period=14
-):
+def calculate_rsi(values, period=14):
 
-    if len(values) < period + 1:
+    if len(values) <= period:
         return None
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(values)
-    ):
+    for i in range(1, len(values)):
 
-        change = (
-            values[i]
-            - values[i - 1]
-        )
+        change = values[i] - values[i - 1]
 
         if change > 0:
-
             gains.append(change)
             losses.append(0)
 
         else:
-
             gains.append(0)
-            losses.append(
-                abs(change)
-            )
+            losses.append(abs(change))
 
-    average_gain = (
-        sum(gains[:period])
-        / period
-    )
+    average_gain = sum(
+        gains[:period]
+    ) / period
 
-    average_loss = (
-        sum(losses[:period])
-        / period
-    )
+    average_loss = sum(
+        losses[:period]
+    ) / period
 
     for i in range(
         period,
-        len(gains)
+        len(gains),
     ):
 
         average_gain = (
-            (
-                average_gain
-                * (period - 1)
-            )
+            (average_gain * (period - 1))
             + gains[i]
         ) / period
 
         average_loss = (
-            (
-                average_loss
-                * (period - 1)
-            )
+            (average_loss * (period - 1))
             + losses[i]
         ) / period
 
     if average_loss == 0:
         return 100.0
 
-    rs = (
-        average_gain
-        / average_loss
-    )
+    rs = average_gain / average_loss
 
-    return (
-        100
-        - (
-            100
-            / (1 + rs)
-        )
+    return 100 - (
+        100 / (1 + rs)
     )
 
 
@@ -456,154 +341,45 @@ def calculate_rsi(
 # ATR
 # ============================================================
 
-def calculate_atr(
-    candles,
-    period=14
-):
+def calculate_atr(candles, period=14):
 
-    if len(candles) < period + 1:
+    if len(candles) <= period:
         return None
 
     true_ranges = []
 
-    for i in range(
-        1,
-        len(candles)
-    ):
+    for i in range(1, len(candles)):
 
-        high = candles[i]["high"]
-        low = candles[i]["low"]
+        current = candles[i]
+        previous = candles[i - 1]
 
-        previous_close = (
-            candles[i - 1]["close"]
-        )
+        high = current["high"]
+        low = current["low"]
+        previous_close = previous["close"]
 
-        true_range = max(
+        tr = max(
             high - low,
-            abs(
-                high
-                - previous_close
-            ),
-            abs(
-                low
-                - previous_close
-            )
+            abs(high - previous_close),
+            abs(low - previous_close),
         )
 
-        true_ranges.append(
-            true_range
-        )
+        true_ranges.append(tr)
 
-    atr = (
-        sum(
-            true_ranges[:period]
-        )
-        / period
-    )
+    if len(true_ranges) < period:
+        return None
 
-    for value in true_ranges[period:]:
+    atr = sum(
+        true_ranges[:period]
+    ) / period
+
+    for tr in true_ranges[period:]:
 
         atr = (
-            (
-                atr
-                * (period - 1)
-            )
-            + value
+            (atr * (period - 1))
+            + tr
         ) / period
 
     return atr
-
-
-# ============================================================
-# CANDLE ANALYSIS
-# ============================================================
-
-def candle_body(candle):
-
-    return abs(
-        candle["close"]
-        - candle["open"]
-    )
-
-
-def candle_range(candle):
-
-    return (
-        candle["high"]
-        - candle["low"]
-    )
-
-
-def bullish_engulfing(candles):
-
-    if len(candles) < 2:
-        return False
-
-    previous = candles[-2]
-    current = candles[-1]
-
-    return (
-        previous["close"]
-        < previous["open"]
-        and current["close"]
-        > current["open"]
-        and current["open"]
-        <= previous["close"]
-        and current["close"]
-        >= previous["open"]
-    )
-
-
-def bearish_engulfing(candles):
-
-    if len(candles) < 2:
-        return False
-
-    previous = candles[-2]
-    current = candles[-1]
-
-    return (
-        previous["close"]
-        > previous["open"]
-        and current["close"]
-        < current["open"]
-        and current["open"]
-        >= previous["close"]
-        and current["close"]
-        <= previous["open"]
-    )
-
-
-def strong_bullish_candle(candle):
-
-    body = candle_body(candle)
-    full_range = candle_range(candle)
-
-    if full_range <= 0:
-        return False
-
-    return (
-        candle["close"]
-        > candle["open"]
-        and body / full_range
-        >= 0.60
-    )
-
-
-def strong_bearish_candle(candle):
-
-    body = candle_body(candle)
-    full_range = candle_range(candle)
-
-    if full_range <= 0:
-        return False
-
-    return (
-        candle["close"]
-        < candle["open"]
-        and body / full_range
-        >= 0.60
-    )
 
 
 # ============================================================
@@ -613,437 +389,34 @@ def strong_bearish_candle(candle):
 def market_structure(candles):
 
     if len(candles) < 10:
-        return "NONE"
+        return "NEUTRAL"
 
-    recent = candles[-8:-1]
-
-    previous_high = max(
-        c["high"]
-        for c in recent
-    )
-
-    previous_low = min(
-        c["low"]
-        for c in recent
-    )
-
-    current = candles[-1]
-
-    if current["close"] > previous_high:
-        return "BOS_BUY"
-
-    if current["close"] < previous_low:
-        return "BOS_SELL"
-
-    return "NONE"
-
-
-def trend_structure(candles):
-
-    if len(candles) < 10:
-        return "MIXED"
+    recent = candles[-10:]
 
     highs = [
-        c["high"]
-        for c in candles[-6:]
+        candle["high"]
+        for candle in recent
     ]
 
     lows = [
-        c["low"]
-        for c in candles[-6:]
+        candle["low"]
+        for candle in recent
     ]
 
-    higher_highs = (
-        highs[-1]
-        > highs[-3]
-    )
-
-    higher_lows = (
-        lows[-1]
-        > lows[-3]
-    )
-
-    lower_highs = (
-        highs[-1]
-        < highs[-3]
-    )
-
-    lower_lows = (
-        lows[-1]
-        < lows[-3]
-    )
-
-    if (
-        higher_highs
-        and higher_lows
-    ):
-
+    if highs[-1] > highs[-3] and lows[-1] > lows[-3]:
         return "BULLISH"
 
-    if (
-        lower_highs
-        and lower_lows
-    ):
-
+    if highs[-1] < highs[-3] and lows[-1] < lows[-3]:
         return "BEARISH"
 
-    return "MIXED"
+    return "NEUTRAL"
 
 
 # ============================================================
-# LIQUIDITY
+# SIGNAL ENGINE
 # ============================================================
 
-def liquidity_sweep(candles):
-
-    if not candles:
-        return "NONE"
-
-    candle = candles[-1]
-
-    body = candle_body(candle)
-
-    if body <= 0:
-        return "NONE"
-
-    upper_wick = (
-        candle["high"]
-        - max(
-            candle["open"],
-            candle["close"]
-        )
-    )
-
-    lower_wick = (
-        min(
-            candle["open"],
-            candle["close"]
-        )
-        - candle["low"]
-    )
-
-    if upper_wick >= body * 2:
-        return "SELL_SWEEP"
-
-    if lower_wick >= body * 2:
-        return "BUY_SWEEP"
-
-    return "NONE"
-
-
-# ============================================================
-# FAIR VALUE GAP
-# ============================================================
-
-def fair_value_gap(candles):
-
-    if len(candles) < 3:
-        return "NONE"
-
-    first = candles[-3]
-    third = candles[-1]
-
-    if (
-        third["low"]
-        > first["high"]
-    ):
-
-        return "BULL"
-
-    if (
-        third["high"]
-        < first["low"]
-    ):
-
-        return "BEAR"
-
-    return "NONE"
-
-
-# ============================================================
-# TIMEFRAME TREND
-# ============================================================
-
-def timeframe_trend(candles):
-
-    if (
-        not candles
-        or len(candles) < 50
-    ):
-
-        return "UNKNOWN"
-
-    closes = [
-        c["close"]
-        for c in candles
-    ]
-
-    ema20 = calculate_ema(
-        closes,
-        20
-    )
-
-    ema50 = calculate_ema(
-        closes,
-        50
-    )
-
-    if (
-        ema20 is None
-        or ema50 is None
-    ):
-
-        return "UNKNOWN"
-
-    price = closes[-1]
-
-    if (
-        price > ema20
-        and ema20 > ema50
-    ):
-
-        return "BULLISH"
-
-    if (
-        price < ema20
-        and ema20 < ema50
-    ):
-
-        return "BEARISH"
-
-    return "MIXED"
-
-
-# ============================================================
-# TRADING SESSION
-# ============================================================
-
-def kill_zone():
-
-    hour = datetime.now(
-        timezone.utc
-    ).hour
-
-    return (
-        7 <= hour <= 16
-    )
-
-
-# ============================================================
-# PENDING ORDER CALCULATOR
-# ============================================================
-
-def build_pending_orders(
-    candles,
-    atr,
-    signal
-):
-
-    if (
-        len(candles) < 3
-        or not atr
-    ):
-
-        return []
-
-    last = candles[-1]
-    previous = candles[-2]
-
-    orders = []
-
-    # --------------------------------------------------------
-    # BUY STOP
-    # --------------------------------------------------------
-
-    buy_stop_entry = (
-        max(
-            last["high"],
-            previous["high"]
-        )
-        + atr * 0.10
-    )
-
-    buy_stop_sl = (
-        buy_stop_entry
-        - atr * 1.5
-    )
-
-    buy_stop_tp1 = (
-        buy_stop_entry
-        + atr * 1.5
-    )
-
-    buy_stop_tp2 = (
-        buy_stop_entry
-        + atr * 2.5
-    )
-
-    buy_stop_tp3 = (
-        buy_stop_entry
-        + atr * 4
-    )
-
-    # --------------------------------------------------------
-    # SELL STOP
-    # --------------------------------------------------------
-
-    sell_stop_entry = (
-        min(
-            last["low"],
-            previous["low"]
-        )
-        - atr * 0.10
-    )
-
-    sell_stop_sl = (
-        sell_stop_entry
-        + atr * 1.5
-    )
-
-    sell_stop_tp1 = (
-        sell_stop_entry
-        - atr * 1.5
-    )
-
-    sell_stop_tp2 = (
-        sell_stop_entry
-        - atr * 2.5
-    )
-
-    sell_stop_tp3 = (
-        sell_stop_entry
-        - atr * 4
-    )
-
-    # --------------------------------------------------------
-    # BUY LIMIT
-    # --------------------------------------------------------
-
-    buy_limit_entry = (
-        last["close"]
-        - atr * 0.50
-    )
-
-    buy_limit_sl = (
-        buy_limit_entry
-        - atr * 1.5
-    )
-
-    buy_limit_tp1 = (
-        buy_limit_entry
-        + atr * 1.5
-    )
-
-    buy_limit_tp2 = (
-        buy_limit_entry
-        + atr * 2.5
-    )
-
-    buy_limit_tp3 = (
-        buy_limit_entry
-        + atr * 4
-    )
-
-    # --------------------------------------------------------
-    # SELL LIMIT
-    # --------------------------------------------------------
-
-    sell_limit_entry = (
-        last["close"]
-        + atr * 0.50
-    )
-
-    sell_limit_sl = (
-        sell_limit_entry
-        + atr * 1.5
-    )
-
-    sell_limit_tp1 = (
-        sell_limit_entry
-        - atr * 1.5
-    )
-
-    sell_limit_tp2 = (
-        sell_limit_entry
-        - atr * 2.5
-    )
-
-    sell_limit_tp3 = (
-        sell_limit_entry
-        - atr * 4
-    )
-
-    if signal == "BUY":
-
-        orders.append(
-            {
-                "type": "BUY STOP",
-                "entry": buy_stop_entry,
-                "sl": buy_stop_sl,
-                "tp1": buy_stop_tp1,
-                "tp2": buy_stop_tp2,
-                "tp3": buy_stop_tp3
-            }
-        )
-
-        orders.append(
-            {
-                "type": "BUY LIMIT",
-                "entry": buy_limit_entry,
-                "sl": buy_limit_sl,
-                "tp1": buy_limit_tp1,
-                "tp2": buy_limit_tp2,
-                "tp3": buy_limit_tp3
-            }
-        )
-
-    elif signal == "SELL":
-
-        orders.append(
-            {
-                "type": "SELL STOP",
-                "entry": sell_stop_entry,
-                "sl": sell_stop_sl,
-                "tp1": sell_stop_tp1,
-                "tp2": sell_stop_tp2,
-                "tp3": sell_stop_tp3
-            }
-        )
-
-        orders.append(
-            {
-                "type": "SELL LIMIT",
-                "entry": sell_limit_entry,
-                "sl": sell_limit_sl,
-                "tp1": sell_limit_tp1,
-                "tp2": sell_limit_tp2,
-                "tp3": sell_limit_tp3
-            }
-        )
-
-    return orders
-
-
-# ============================================================
-# GOLD AI ANALYSIS
-# ============================================================
-
-def analyze_gold():
-
-    candles, error = get_candles(
-        MAIN_INTERVAL,
-        OUTPUT_SIZE
-    )
-
-    if error:
-        return None, error
-
-    if len(candles) < 60:
-
-        return None, (
-            "Not enough 15-minute "
-            "candle data."
-        )
+def generate_signal(candles):
 
     closes = [
         candle["close"]
@@ -1054,1463 +427,1050 @@ def analyze_gold():
 
     ema20 = calculate_ema(
         closes,
-        20
+        20,
     )
 
     ema50 = calculate_ema(
         closes,
-        50
+        50,
     )
 
     rsi = calculate_rsi(
         closes,
-        14
+        14,
     )
 
     atr = calculate_atr(
         candles,
-        14
+        14,
     )
-
-    if None in (
-        ema20,
-        ema50,
-        rsi,
-        atr
-    ):
-
-        return None, (
-            "Unable to calculate "
-            "indicators."
-        )
-
-    # ========================================================
-    # HIGHER TIMEFRAME
-    # ========================================================
-
-    htf_candles, htf_error = (
-        get_candles(
-            HTF_INTERVAL,
-            100
-        )
-    )
-
-    entry_candles, entry_error = (
-        get_candles(
-            ENTRY_INTERVAL,
-            100
-        )
-    )
-
-    if not htf_error:
-
-        htf_trend = timeframe_trend(
-            htf_candles
-        )
-
-    else:
-
-        htf_trend = "UNKNOWN"
-
-    if not entry_error:
-
-        entry_trend = timeframe_trend(
-            entry_candles
-        )
-
-    else:
-
-        entry_trend = "UNKNOWN"
-
-    # ========================================================
-    # STRUCTURE
-    # ========================================================
 
     structure = market_structure(
         candles
     )
 
-    structure_trend = trend_structure(
-        candles
-    )
+    if (
+        ema20 is None
+        or ema50 is None
+        or rsi is None
+        or atr is None
+    ):
+        return None
 
-    sweep = liquidity_sweep(
-        candles
-    )
-
-    fvg = fair_value_gap(
-        candles
-    )
-
-    last_candle = candles[-1]
-
-    score = 0
-
-    reasons = []
-
-    warnings = []
+    bullish_points = 0
+    bearish_points = 0
 
     # ========================================================
     # EMA TREND
     # ========================================================
 
-    if price > ema20:
-
-        score += 1
-
-        reasons.append(
-            "Price above EMA20"
-        )
-
-    else:
-
-        score -= 1
-
     if ema20 > ema50:
+        bullish_points += 30
 
-        score += 2
+    elif ema20 < ema50:
+        bearish_points += 30
 
-        reasons.append(
-            "EMA20 above EMA50"
-        )
+    # ========================================================
+    # PRICE VS EMA
+    # ========================================================
 
-    else:
+    if price > ema20:
+        bullish_points += 20
 
-        score -= 2
+    elif price < ema20:
+        bearish_points += 20
 
     # ========================================================
     # RSI
     # ========================================================
 
-    if 55 <= rsi <= 68:
+    if 50 <= rsi <= 70:
+        bullish_points += 20
 
-        score += 2
+    elif 30 <= rsi < 50:
+        bearish_points += 20
 
-        reasons.append(
-            "Bullish RSI momentum"
-        )
+    elif rsi > 70:
+        bullish_points += 10
 
-    elif 32 <= rsi <= 45:
-
-        score -= 2
-
-        reasons.append(
-            "Bearish RSI momentum"
-        )
-
-    elif rsi > 72:
-
-        score -= 2
-
-        warnings.append(
-            "RSI overbought"
-        )
-
-    elif rsi < 28:
-
-        score += 1
-
-        warnings.append(
-            "RSI oversold"
-        )
-
-    else:
-
-        warnings.append(
-            "RSI neutral"
-        )
-
-    # ========================================================
-    # ATR
-    # ========================================================
-
-    if atr >= 4:
-
-        reasons.append(
-            "Healthy GOLD volatility"
-        )
-
-    else:
-
-        score -= 2
-
-        warnings.append(
-            "Low volatility"
-        )
-
-    # ========================================================
-    # CANDLE
-    # ========================================================
-
-    if bullish_engulfing(
-        candles
-    ):
-
-        score += 2
-
-        reasons.append(
-            "Bullish engulfing"
-        )
-
-    elif bearish_engulfing(
-        candles
-    ):
-
-        score -= 2
-
-        reasons.append(
-            "Bearish engulfing"
-        )
-
-    elif strong_bullish_candle(
-        last_candle
-    ):
-
-        score += 1
-
-        reasons.append(
-            "Strong bullish candle"
-        )
-
-    elif strong_bearish_candle(
-        last_candle
-    ):
-
-        score -= 1
-
-        reasons.append(
-            "Strong bearish candle"
-        )
-
-    else:
-
-        warnings.append(
-            "Weak candle confirmation"
-        )
+    elif rsi < 30:
+        bearish_points += 10
 
     # ========================================================
     # MARKET STRUCTURE
     # ========================================================
 
-    if structure == "BOS_BUY":
+    if structure == "BULLISH":
+        bullish_points += 30
 
-        score += 3
-
-        reasons.append(
-            "Bullish Break of Structure"
-        )
-
-    elif structure == "BOS_SELL":
-
-        score -= 3
-
-        reasons.append(
-            "Bearish Break of Structure"
-        )
+    elif structure == "BEARISH":
+        bearish_points += 30
 
     # ========================================================
-    # LIQUIDITY
+    # DETERMINE SIGNAL
     # ========================================================
 
-    if sweep == "BUY_SWEEP":
+    if bullish_points > bearish_points:
 
-        score += 1
+        side = "BUY"
 
-        reasons.append(
-            "Buy-side liquidity sweep"
-        )
+        confidence = bullish_points
 
-    elif sweep == "SELL_SWEEP":
+    elif bearish_points > bullish_points:
 
-        score -= 1
+        side = "SELL"
 
-        reasons.append(
-            "Sell-side liquidity sweep"
-        )
-
-    # ========================================================
-    # FVG
-    # ========================================================
-
-    if fvg == "BULL":
-
-        score += 1
-
-        reasons.append(
-            "Bullish FVG"
-        )
-
-    elif fvg == "BEAR":
-
-        score -= 1
-
-        reasons.append(
-            "Bearish FVG"
-        )
-
-    # ========================================================
-    # 1H
-    # ========================================================
-
-    if htf_trend == "BULLISH":
-
-        score += 3
-
-        reasons.append(
-            "1H bullish confirmation"
-        )
-
-    elif htf_trend == "BEARISH":
-
-        score -= 3
-
-        reasons.append(
-            "1H bearish confirmation"
-        )
+        confidence = bearish_points
 
     else:
 
-        warnings.append(
-            "1H trend mixed"
-        )
+        return {
+            "signal": "WAIT",
+            "confidence": 50,
+            "price": price,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi": rsi,
+            "atr": atr,
+            "structure": structure,
+        }
 
     # ========================================================
-    # 5M
+    # FILTER WEAK SIGNALS
     # ========================================================
 
-    if entry_trend == "BULLISH":
+    if confidence < MIN_CONFIDENCE:
 
-        score += 2
-
-        reasons.append(
-            "5M bullish confirmation"
-        )
-
-    elif entry_trend == "BEARISH":
-
-        score -= 2
-
-        reasons.append(
-            "5M bearish confirmation"
-        )
-
-    else:
-
-        warnings.append(
-            "5M trend mixed"
-        )
+        return {
+            "signal": "WAIT",
+            "confidence": confidence,
+            "price": price,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi": rsi,
+            "atr": atr,
+            "structure": structure,
+        }
 
     # ========================================================
-    # SESSION
+    # TRADE LEVELS
     # ========================================================
 
-    active_session = kill_zone()
+    if side == "BUY":
 
-    if active_session:
+        entry = price
 
-        reasons.append(
-            "Active London/New York session"
-        )
-
-    else:
-
-        score -= 1
-
-        warnings.append(
-            "Outside preferred session"
-        )
-
-    # ========================================================
-    # RAW SIGNAL
-    # ========================================================
-
-    if score >= SIGNAL_SCORE:
-
-        signal = "BUY"
-        icon = "🟢"
-
-    elif score <= -SIGNAL_SCORE:
-
-        signal = "SELL"
-        icon = "🔴"
-
-    else:
-
-        signal = "WAIT"
-        icon = "🟡"
-
-    # ========================================================
-    # CONFLICT FILTER
-    # ========================================================
-
-    if signal == "BUY":
-
-        if htf_trend == "BEARISH":
-
-            signal = "WAIT"
-            icon = "🟡"
-
-            warnings.append(
-                "1H conflicts with BUY"
-            )
-
-        if entry_trend == "BEARISH":
-
-            signal = "WAIT"
-            icon = "🟡"
-
-            warnings.append(
-                "5M conflicts with BUY"
-            )
-
-    elif signal == "SELL":
-
-        if htf_trend == "BULLISH":
-
-            signal = "WAIT"
-            icon = "🟡"
-
-            warnings.append(
-                "1H conflicts with SELL"
-            )
-
-        if entry_trend == "BULLISH":
-
-            signal = "WAIT"
-            icon = "🟡"
-
-            warnings.append(
-                "5M conflicts with SELL"
-            )
-
-    # ========================================================
-    # SIGNAL STRENGTH
-    # ========================================================
-
-    confidence = min(
-        99,
-        max(
-            35,
-            50 + abs(score) * 4
-        )
-    )
-
-    # ========================================================
-    # RISK LEVELS
-    # ========================================================
-
-    entry = price
-
-    stop_loss = None
-    tp1 = None
-    tp2 = None
-    tp3 = None
-
-    if signal == "BUY":
-
-        stop_loss = (
+        sl = (
             entry
-            - atr * 1.5
+            - (
+                atr
+                * SL_ATR_MULTIPLIER
+            )
         )
 
         tp1 = (
             entry
-            + atr * 1.5
+            + (
+                atr
+                * TP1_ATR_MULTIPLIER
+            )
         )
 
         tp2 = (
             entry
-            + atr * 2.5
+            + (
+                atr
+                * TP2_ATR_MULTIPLIER
+            )
         )
 
         tp3 = (
             entry
-            + atr * 4
+            + (
+                atr
+                * TP3_ATR_MULTIPLIER
+            )
         )
 
-    elif signal == "SELL":
+        pending_type = "BUY STOP / MARKET BUY"
 
-        stop_loss = (
+    else:
+
+        entry = price
+
+        sl = (
             entry
-            + atr * 1.5
+            + (
+                atr
+                * SL_ATR_MULTIPLIER
+            )
         )
 
         tp1 = (
             entry
-            - atr * 1.5
+            - (
+                atr
+                * TP1_ATR_MULTIPLIER
+            )
         )
 
         tp2 = (
             entry
-            - atr * 2.5
+            - (
+                atr
+                * TP2_ATR_MULTIPLIER
+            )
         )
 
         tp3 = (
             entry
-            - atr * 4
+            - (
+                atr
+                * TP3_ATR_MULTIPLIER
+            )
         )
 
-    pending_orders = (
-        build_pending_orders(
-            candles,
-            atr,
-            signal
-        )
-    )
+        pending_type = "SELL STOP / MARKET SELL"
 
     return {
+        "signal": side,
+        "confidence": confidence,
         "price": price,
-
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "ema20": ema20,
         "ema50": ema50,
-
         "rsi": rsi,
         "atr": atr,
-
-        "signal": signal,
-        "icon": icon,
-
-        "score": score,
-        "confidence": confidence,
-
-        "trend": structure_trend,
-
-        "htf_trend": htf_trend,
-
-        "entry_trend": entry_trend,
-
         "structure": structure,
-
-        "sweep": sweep,
-
-        "fvg": fvg,
-
-        "active_session": active_session,
-
-        "reasons": reasons,
-
-        "warnings": warnings,
-
-        "entry": entry,
-
-        "stop_loss": stop_loss,
-
-        "tp1": tp1,
-
-        "tp2": tp2,
-
-        "tp3": tp3,
-
-        "pending_orders": pending_orders,
-
-        "candle_time": candles[-1][
-            "datetime"
-        ]
-
-    }, None
-
-
-# ============================================================
-# TRADE CHECK
-# ============================================================
-
-def market_trade_exists(
-    side
-):
-
-    for trade in open_trades:
-
-        if (
-            trade.get("status")
-            == "OPEN"
-            and trade.get("type")
-            == "MARKET"
-            and trade.get("side")
-            == side
-        ):
-
-            return True
-
-    return False
-
-
-def pending_trade_exists(
-    order_type,
-    entry
-):
-
-    for trade in open_trades:
-
-        if (
-            trade.get("status")
-            == "PENDING"
-            and trade.get("type")
-            == order_type
-        ):
-
-            if abs(
-                trade.get("entry", 0)
-                - entry
-            ) < 0.20:
-
-                return True
-
-    return False
-
-
-# ============================================================
-# CREATE MARKET TRADE
-# ============================================================
-
-def create_market_trade(
-    result
-):
-
-    global last_signal_key
-
-    if result["signal"] == "WAIT":
-        return False
-
-    if (
-        result["confidence"]
-        < MIN_CONFIDENCE
-    ):
-
-        return False
-
-    signal_key = (
-        "MARKET",
-        result["signal"],
-        result["candle_time"]
-    )
-
-    if signal_key == last_signal_key:
-        return False
-
-    if market_trade_exists(
-        result["signal"]
-    ):
-
-        return False
-
-    trade = {
-
-        "id": int(
-            time.time() * 1000
-        ),
-
-        "symbol": XAU_SYMBOL,
-
-        "type": "MARKET",
-
-        "side": result["signal"],
-
-        "entry": result["entry"],
-
-        "sl": result["stop_loss"],
-
-        "initial_sl": result[
-            "stop_loss"
-        ],
-
-        "tp1": result["tp1"],
-
-        "tp2": result["tp2"],
-
-        "tp3": result["tp3"],
-
-        "tp1_hit": False,
-
-        "tp2_hit": False,
-
-        "tp3_hit": False,
-
-        "break_even": False,
-
-        "status": "OPEN",
-
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "order_type": pending_type,
     }
 
-    open_trades.append(
-        trade
+
+# ============================================================
+# FORMAT SIGNAL
+# ============================================================
+
+def format_signal(signal):
+
+    side = signal["signal"]
+
+    if side == "BUY":
+        emoji = "🟢"
+    else:
+        emoji = "🔴"
+
+    now = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M UTC"
     )
-
-    last_signal_key = (
-        signal_key
-    )
-
-    save_trades()
-
-    return True
-
-
-# ============================================================
-# CREATE PENDING TRADE
-# ============================================================
-
-def create_pending_trade(
-    order
-):
-
-    if pending_trade_exists(
-        order["type"],
-        order["entry"]
-    ):
-
-        return False
-
-    trade = {
-
-        "id": int(
-            time.time() * 1000
-        ),
-
-        "symbol": XAU_SYMBOL,
-
-        "type": order["type"],
-
-        "side": (
-            "BUY"
-            if "BUY"
-            in order["type"]
-            else "SELL"
-        ),
-
-        "entry": order["entry"],
-
-        "sl": order["sl"],
-
-        "initial_sl": order["sl"],
-
-        "tp1": order["tp1"],
-
-        "tp2": order["tp2"],
-
-        "tp3": order["tp3"],
-
-        "tp1_hit": False,
-
-        "tp2_hit": False,
-
-        "tp3_hit": False,
-
-        "break_even": False,
-
-        "status": "PENDING",
-
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
-    open_trades.append(
-        trade
-    )
-
-    save_trades()
-
-    return True
-
-
-# ============================================================
-# TELEGRAM MESSAGE
-# ============================================================
-
-async def send_chat_message(
-    context,
-    text
-):
-
-    if not CHAT_ID:
-
-        logger.warning(
-            "CHAT_ID is missing."
-        )
-
-        return False
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-            parse_mode="Markdown"
-        )
-
-        return True
-
-    except Exception as error:
-
-        logger.error(
-            "Telegram send error: %s",
-            error
-        )
-
-        return False
-
-
-# ============================================================
-# FORMAT PENDING ORDER
-# ============================================================
-
-def format_pending_order(
-    order
-):
-
-    return (
-        f"📌 *{order['type']}*\n"
-        f"Entry: `${order['entry']:,.2f}`\n"
-        f"SL: `${order['sl']:,.2f}`\n"
-        f"TP1: `${order['tp1']:,.2f}`\n"
-        f"TP2: `${order['tp2']:,.2f}`\n"
-        f"TP3: `${order['tp3']:,.2f}`\n"
-    )
-
-
-# ============================================================
-# FORMAT ANALYSIS
-# ============================================================
-
-def format_analysis(
-    result
-):
 
     message = (
+        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
 
-        "👑 *KING OF XAU_NAS — "
-        "INSTITUTIONAL AI* 👑\n\n"
-
-        "🟡 *XAU/USD GOLD*\n\n"
-
-        f"💰 Price: "
-        f"`${result['price']:,.2f}`\n"
-
-        f"📈 Structure: "
-        f"*{result['trend']}*\n"
-
-        f"🧠 AI Score: "
-        f"`{result['score']}`\n"
-
-        f"💪 Signal Strength: "
-        f"`{result['confidence']}%`\n\n"
+        "🟡 *XAU/USD*\n"
+        f"{emoji} *SIGNAL: {side}*\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
-
-        "📊 *MULTI-TIMEFRAME*\n"
-
+        "🧠 *AI MARKET ANALYSIS*\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"1H Trend: "
-        f"*{result['htf_trend']}*\n"
+        f"📊 Structure: "
+        f"*{signal['structure']}*\n"
 
-        f"15M Setup: "
-        f"*{result['trend']}*\n"
+        f"🎯 Confidence: "
+        f"*{signal['confidence']}%*\n\n"
 
-        f"5M Entry: "
-        f"*{result['entry_trend']}*\n\n"
+        f"💰 Entry: "
+        f"`${signal['entry']:,.2f}`\n"
+
+        f"🛑 Stop Loss: "
+        f"`${signal['sl']:,.2f}`\n\n"
+
+        f"🎯 TP1: "
+        f"`${signal['tp1']:,.2f}`\n"
+
+        f"🎯 TP2: "
+        f"`${signal['tp2']:,.2f}`\n"
+
+        f"🏆 TP3: "
+        f"`${signal['tp3']:,.2f}`\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
-
-        "📊 *TECHNICAL ENGINE*\n"
-
+        "📈 *TECHNICAL DATA*\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
 
         f"EMA 20: "
-        f"`{result['ema20']:,.2f}`\n"
+        f"`{signal['ema20']:,.2f}`\n"
 
         f"EMA 50: "
-        f"`{result['ema50']:,.2f}`\n"
+        f"`{signal['ema50']:,.2f}`\n"
 
         f"RSI 14: "
-        f"`{result['rsi']:.1f}`\n"
+        f"`{signal['rsi']:.1f}`\n"
 
         f"ATR 14: "
-        f"`{result['atr']:.2f}`\n"
+        f"`{signal['atr']:.2f}`\n\n"
 
-        f"BOS: "
-        f"`{result['structure']}`\n"
+        f"⏱ Timeframe: *{INTERVAL}*\n"
 
-        f"Liquidity: "
-        f"`{result['sweep']}`\n"
+        f"📌 Order Type: "
+        f"*{signal['order_type']}*\n\n"
 
-        f"FVG: "
-        f"`{result['fvg']}`\n\n"
+        f"🕐 {now}\n\n"
 
-        "━━━━━━━━━━━━━━━━━━\n"
-
-        "🎯 *SIGNAL*\n"
-
-        "━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"{result['icon']} "
-        f"Signal: *{result['signal']}*\n"
-
-        f"🧠 Strength: "
-        f"`{result['confidence']}%`\n"
-    )
-
-    if result["signal"] != "WAIT":
-
-        message += (
-
-            "\n"
-
-            f"🎯 Entry: "
-            f"`${result['entry']:,.2f}`\n"
-
-            f"🛑 SL: "
-            f"`${result['stop_loss']:,.2f}`\n"
-
-            f"🎯 TP1: "
-            f"`${result['tp1']:,.2f}`\n"
-
-            f"🎯 TP2: "
-            f"`${result['tp2']:,.2f}`\n"
-
-            f"🏆 TP3: "
-            f"`${result['tp3']:,.2f}`\n"
-        )
-
-        if result[
-            "pending_orders"
-        ]:
-
-            message += (
-                "\n📌 *PENDING SETUPS*\n"
-            )
-
-            for order in result[
-                "pending_orders"
-            ]:
-
-                message += (
-                    "\n"
-                    + format_pending_order(
-                        order
-                    )
-                )
-
-    else:
-
-        message += (
-
-            "\n"
-
-            "⏳ *WAIT — "
-            "NO ELITE SETUP*\n"
-
-            "The filters are not "
-            "sufficiently aligned.\n"
-        )
-
-    if result["reasons"]:
-
-        message += (
-            "\n🧠 *CONFIRMATIONS*\n"
-        )
-
-        for reason in result[
-            "reasons"
-        ][:10]:
-
-            message += (
-                f"✅ {reason}\n"
-            )
-
-    if result["warnings"]:
-
-        message += (
-            "\n⚠️ *WARNINGS*\n"
-        )
-
-        for warning in result[
-            "warnings"
-        ][:7]:
-
-            message += (
-                f"• {warning}\n"
-            )
-
-    message += (
-
-        "\n━━━━━━━━━━━━━━━━━━\n"
-
-        f"⏱️ Timeframe: "
-        f"*{MAIN_INTERVAL}*\n"
-
-        "📡 Data: Twelve Data\n"
-
-        "📲 Alerts: Telegram only\n\n"
-
-        "⚠️ Signal strength is NOT "
-        "guaranteed win probability.\n"
-
-        "⚠️ Analysis only — "
-        "not financial advice.\n"
-
-        "⚠️ No broker orders are placed."
+        "⚠️ *Market information is for "
+        "analysis only. Not financial advice.*"
     )
 
     return message
 
 
 # ============================================================
-# AUTOMATIC SIGNAL ALERT
+# WAIT MESSAGE
 # ============================================================
 
-def format_signal_alert(
-    result
-):
+def format_wait(signal):
 
-    message = (
+    return (
+        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+        "🟡 *XAU/USD*\n\n"
+        "⏳ *WAIT — NO HIGH QUALITY SETUP*\n\n"
+        f"💰 Price: "
+        f"`${signal['price']:,.2f}`\n\n"
 
-        "🚨 *NEW KING OF XAU_NAS SIGNAL* 🚨\n\n"
+        f"📈 Structure: "
+        f"*{signal['structure']}*\n"
 
-        f"{result['icon']} "
-        f"*{result['signal']} XAU/USD*\n\n"
+        f"🎯 Confidence: "
+        f"*{signal['confidence']}%*\n\n"
 
-        f"💰 Entry: "
-        f"`${result['entry']:,.2f}`\n"
+        f"EMA 20: "
+        f"`{signal['ema20']:,.2f}`\n"
 
-        f"🛑 SL: "
-        f"`${result['stop_loss']:,.2f}`\n"
+        f"EMA 50: "
+        f"`{signal['ema50']:,.2f}`\n"
 
-        f"🎯 TP1: "
-        f"`${result['tp1']:,.2f}`\n"
+        f"RSI 14: "
+        f"`{signal['rsi']:.1f}`\n"
 
-        f"🎯 TP2: "
-        f"`${result['tp2']:,.2f}`\n"
+        f"ATR 14: "
+        f"`{signal['atr']:.2f}`\n\n"
 
-        f"🏆 TP3: "
-        f"`${result['tp3']:,.2f}`\n\n"
-
-        f"🧠 Strength: "
-        f"`{result['confidence']}%`\n"
-
-        f"📊 Score: "
-        f"`{result['score']}`\n\n"
-
-        f"1H: `{result['htf_trend']}`\n"
-
-        f"15M: `{result['trend']}`\n"
-
-        f"5M: `{result['entry_trend']}`\n"
+        "🤖 *AI is monitoring the market.*"
     )
-
-    if result[
-        "pending_orders"
-    ]:
-
-        message += (
-            "\n📌 *PENDING ORDER ALERTS*\n"
-        )
-
-        for order in result[
-            "pending_orders"
-        ]:
-
-            message += (
-                "\n"
-                + format_pending_order(
-                    order
-                )
-            )
-
-    message += (
-
-        "\n━━━━━━━━━━━━━━━━━━\n"
-
-        "📲 Telegram signal only\n"
-
-        "⚠️ No broker order has "
-        "been placed.\n"
-
-        "⚠️ Always manage risk."
-    )
-
-    return message
-
-
-# ============================================================
-# ACTIVATE PENDING ORDER
-# ============================================================
-
-def activate_pending(
-    trade,
-    price
-):
-
-    if trade.get(
-        "status"
-    ) != "PENDING":
-
-        return False
-
-    order_type = trade["type"]
-
-    entry = trade["entry"]
-
-    activated = False
-
-    if (
-        order_type == "BUY STOP"
-        and price >= entry
-    ):
-
-        activated = True
-
-    elif (
-        order_type == "BUY LIMIT"
-        and price <= entry
-    ):
-
-        activated = True
-
-    elif (
-        order_type == "SELL STOP"
-        and price <= entry
-    ):
-
-        activated = True
-
-    elif (
-        order_type == "SELL LIMIT"
-        and price >= entry
-    ):
-
-        activated = True
-
-    if activated:
-
-        trade["status"] = "OPEN"
-
-        trade["activation_price"] = price
-
-        trade["activated_at"] = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
-
-        return True
-
-    return False
 
 
 # ============================================================
 # TRADE MONITOR
 # ============================================================
 
-async def monitor_trades(
-    context
+async def monitor_trade(
+    context,
+    price,
+):
+
+    global active_trade
+
+    if not active_trade:
+        return
+
+    trade = active_trade
+
+    side = trade["signal"]
+
+    # ========================================================
+    # BUY
+    # ========================================================
+
+    if side == "BUY":
+
+        if not trade["tp1_hit"] and price >= trade["tp1"]:
+
+            trade["tp1_hit"] = True
+
+            await send_chat_message(
+                context,
+                (
+                    "👑 *TP1 HIT* 🎯\n\n"
+                    "🟡 XAU/USD\n"
+                    "🟢 BUY\n\n"
+                    f"💰 Price: `${price:,.2f}`\n\n"
+                    "🔒 TP1 reached.\n"
+                    "📈 Trade continues toward TP2."
+                ),
+            )
+
+        if not trade["tp2_hit"] and price >= trade["tp2"]:
+
+            trade["tp2_hit"] = True
+
+            await send_chat_message(
+                context,
+                (
+                    "👑 *TP2 HIT* 🎯🎯\n\n"
+                    "🟡 XAU/USD\n"
+                    "🟢 BUY\n\n"
+                    f"💰 Price: `${price:,.2f}`\n\n"
+                    "🏆 TP2 reached.\n"
+                    "🚀 Final target: TP3."
+                ),
+            )
+
+        if not trade["tp3_hit"] and price >= trade["tp3"]:
+
+            trade["tp3_hit"] = True
+
+            await send_chat_message(
+                context,
+                (
+                    "👑 *TP3 HIT — "
+                    "TRADE COMPLETE* 🏆\n\n"
+
+                    "🟡 XAU/USD\n"
+                    "🟢 BUY\n\n"
+
+                    f"💰 Exit: `${price:,.2f}`\n\n"
+
+                    "🏆 *Full target reached.*\n"
+                    "✅ Trade completed."
+                ),
+            )
+
+            active_trade = None
+
+            return
+
+        if price <= trade["sl"]:
+
+            await send_chat_message(
+                context,
+                (
+                    "🛑 *STOP LOSS HIT*\n\n"
+                    "🟡 XAU/USD\n"
+                    "🟢 BUY\n\n"
+
+                    f"💰 Exit: `${price:,.2f}`\n\n"
+
+                    "❌ Trade closed at SL."
+                ),
+            )
+
+            active_trade = None
+
+            return
+
+    # ========================================================
+    # SELL
+    # ========================================================
+
+    elif side == "SELL":
+
+        if not trade["tp1_hit"] and price <= trade["tp1"]:
+
+            trade["tp1_hit"] = True
+
+            await send_chat_message(
+                context,
+                (
+                    "👑 *TP1 HIT* 🎯\n\n"
+                    "🟡 XAU/USD\n"
+                    "🔴 SELL\n\n"
+                    f"💰 Price: `${price:,.2f}`\n\n"
+                    "🔒 TP1 reached.\n"
+                    "📉 Trade continues toward TP2."
+                ),
+            )
+
+        if not trade["tp2_hit"] and price <= trade["tp2"]:
+
+            trade["tp2_hit"] = True
+
+            await send_chat_message(
+                context,
+                (
+                    "👑 *TP2 HIT* 🎯🎯\n\n"
+                    "🟡 XAU/USD\n"
+                    "🔴 SELL\n\n"
+                    f"💰 Price: `${price:,.2f}`\n\n"
+                    "🏆 TP2 reached.\n"
+                    "🚀 Final target: TP3."
+                ),
+            )
+
+        if not trade["tp3_hit"] and price <= trade["tp3"]:
+
+            trade["tp3_hit"] = True
+
+            await send_chat_message(
+                context,
+                (
+                    "👑 *TP3 HIT — "
+                    "TRADE COMPLETE* 🏆\n\n"
+
+                    "🟡 XAU/USD\n"
+                    "🔴 SELL\n\n"
+
+                    f"💰 Exit: `${price:,.2f}`\n\n"
+
+                    "🏆 *Full target reached.*\n"
+                    "✅ Trade completed."
+                ),
+            )
+
+            active_trade = None
+
+            return
+
+        if price >= trade["sl"]:
+
+            await send_chat_message(
+                context,
+                (
+                    "🛑 *STOP LOSS HIT*\n\n"
+                    "🟡 XAU/USD\n"
+                    "🔴 SELL\n\n"
+
+                    f"💰 Exit: `${price:,.2f}`\n\n"
+
+                    "❌ Trade closed at SL."
+                ),
+            )
+
+            active_trade = None
+
+            return
+
+
+# ============================================================
+# MARKET SCANNER
+# ============================================================
+
+async def scan_market(
+    context,
+    force=False,
+):
+
+    global last_signal_key
+    global active_trade
+
+    candles = await asyncio.to_thread(
+        get_gold_data
+    )
+
+    if not candles:
+
+        logger.warning(
+            "Unable to retrieve gold data."
+        )
+
+        return
+
+    signal = generate_signal(
+        candles
+    )
+
+    if not signal:
+
+        logger.warning(
+            "Unable to generate signal."
+        )
+
+        return
+
+    price = signal["price"]
+
+    # ========================================================
+    # MONITOR ACTIVE TRADE
+    # ========================================================
+
+    if active_trade:
+
+        await monitor_trade(
+            context,
+            price,
+        )
+
+    # ========================================================
+    # WAIT
+    # ========================================================
+
+    if signal["signal"] == "WAIT":
+
+        logger.info(
+            "WAIT | Price %.2f | Confidence %s%%",
+            price,
+            signal["confidence"],
+        )
+
+        return
+
+    # ========================================================
+    # UNIQUE SIGNAL KEY
+    # ========================================================
+
+    candle_time = candles[-1]["datetime"]
+
+    signal_key = (
+        f"{candle_time}_"
+        f"{signal['signal']}"
+    )
+
+    # Don't send duplicate signal
+    # for the same candle.
+    if not force and signal_key == last_signal_key:
+
+        logger.info(
+            "Duplicate signal skipped."
+        )
+
+        return
+
+    # ========================================================
+    # REPLACE ACTIVE TRADE
+    # ========================================================
+
+    active_trade = {
+        "signal": signal["signal"],
+        "entry": signal["entry"],
+        "sl": signal["sl"],
+        "tp1": signal["tp1"],
+        "tp2": signal["tp2"],
+        "tp3": signal["tp3"],
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "created_at": candle_time,
+    }
+
+    last_signal_key = signal_key
+
+    message = format_signal(
+        signal
+    )
+
+    await send_chat_message(
+        context,
+        message,
+    )
+
+    logger.info(
+        "%s signal sent | Entry %.2f | SL %.2f | TP3 %.2f | Confidence %s%%",
+        signal["signal"],
+        signal["entry"],
+        signal["sl"],
+        signal["tp3"],
+        signal["confidence"],
+    )
+
+
+# ============================================================
+# BACKGROUND MONITOR
+# ============================================================
+
+async def background_monitor(
+    context,
 ):
 
     logger.info(
-        "Trade monitor started."
+        "Background gold scanner started."
     )
 
-    while True:
+    while not stop_event.is_set():
 
         try:
 
-            price, error = get_price()
+            await scan_market(
+                context
+            )
 
-            if (
-                error
-                or price is None
-            ):
+        except asyncio.CancelledError:
 
-                await asyncio.sleep(
-                    MONITOR_SECONDS
-                )
+            logger.info(
+                "Background monitor cancelled."
+            )
 
-                continue
+            break
 
-            changed = False
+        except Exception as e:
 
-            for trade in open_trades:
+            logger.exception(
+                "Monitor error: %s",
+                e,
+            )
 
-                # ==================================================
-                # PENDING
-                # ==================================================
+        try:
 
-                if trade.get(
-                    "status"
-                ) == "PENDING":
+            await asyncio.sleep(
+                SCAN_SECONDS
+            )
 
-                    if activate_pending(
-                        trade,
-                        price
-                    ):
+        except asyncio.CancelledError:
 
-                        changed = True
+            break
 
-                        await send_chat_message(
-                            context,
-                            (
-                                "⚡ *PENDING "
-                                "ORDER ACTIVATED*\n\n"
 
-                                "🟡 XAU/USD\n"
+# ============================================================
+# /START
+# ============================================================
 
-                                f"📌 "
-                                f"{trade['type']}\n"
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-                                f"💰 Activation: "
-                                f"`${price:,.2f}`\n"
+    chat_id = update.effective_chat.id
 
-                                f"🛑 SL: "
-                                f"`${trade['sl']:,.2f}`\n"
+    message = (
+        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
 
-                                f"🎯 TP1: "
-                                f"`${trade['tp1']:,.2f}`"
-                            )
-                        )
+        "🟢 *BOT ONLINE*\n\n"
 
-                # ==================================================
-                # ONLY OPEN TRADES
-                # ==================================================
+        "🟡 Market: *XAU/USD*\n"
+        f"⏱ Timeframe: *{INTERVAL}*\n"
+        "📡 Data: *Twelve Data*\n"
+        "🤖 Engine: *AI Technical Scanner*\n\n"
 
-                if trade.get(
-                    "status"
-                ) != "OPEN":
+        "The bot is monitoring GOLD for "
+        "high-quality BUY and SELL setups.\n\n"
 
-                    continue
+        "Commands:\n"
+        "• /start — Start bot\n"
+        "• /status — Bot status\n"
+        "• /scan — Scan GOLD now\n"
+        "• /trade — Current trade\n\n"
 
-                side = trade["side"]
+        "⚠️ Analysis only. Not financial advice."
+    )
 
-                # ==================================================
-                # TP1
-                # ==================================================
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=message,
+        parse_mode="Markdown",
+    )
 
-                if not trade[
-                    "tp1_hit"
-                ]:
 
-                    tp1_reached = (
+# ============================================================
+# /STATUS
+# ============================================================
 
-                        price
-                        >= trade["tp1"]
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-                        if side == "BUY"
+    status = (
+        "👑 *KING OF XAU_NAS — GOLD*\n\n"
+        "🟢 *STATUS: ONLINE*\n\n"
+        f"🟡 Symbol: `{XAU_SYMBOL}`\n"
+        f"⏱ Timeframe: `{INTERVAL}`\n"
+        f"🔄 Scanner: Every `{SCAN_SECONDS}` seconds\n"
+        f"🎯 Minimum confidence: `{MIN_CONFIDENCE}%`\n"
+        "📡 Data: `Twelve Data`\n"
+        "📲 Notifications: `Telegram`\n"
+    )
 
-                        else
+    if active_trade:
 
-                        price
-                        <= trade["tp1"]
-                    )
+        status += (
+            "\n━━━━━━━━━━━━━━━━━━\n"
+            "📊 *ACTIVE SIGNAL*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
 
-                    if tp1_reached:
+            f"Direction: "
+            f"*{active_trade['signal']}*\n"
 
-                        trade[
-                            "tp1_hit"
-                        ] = True
+            f"Entry: "
+            f"`${active_trade['entry']:,.2f}`\n"
 
-                        trade[
-                            "sl"
-                        ] = trade[
-                            "entry"
-                        ]
+            f"SL: "
+            f"`${active_trade['sl']:,.2f}`\n"
 
-                        trade[
-                            "break_even"
-                        ] = True
+            f"TP1: "
+            f"`${active_trade['tp1']:,.2f}`\n"
 
-                        changed = True
+            f"TP2: "
+            f"`${active_trade['tp2']:,.2f}`\n"
 
-                        await send_chat_message(
-                            context,
-                            (
-                                f"🎯 *TP1 HIT — "
-                                f"{side}*\n\n"
+            f"TP3: "
+            f"`${active_trade['tp3']:,.2f}`\n"
+        )
 
-                                "🟡 XAU/USD\n"
+    else:
 
-                                f"💰 Price: "
-                                f"`${price:,.2f}`\n"
+        status += (
+            "\n📭 *No active trade.*"
+        )
 
-                                "🛡️ SL moved "
-                                "to BREAK-EVEN."
-                            )
-                        )
+    await update.message.reply_text(
+        status,
+        parse_mode="Markdown",
+    )
 
-                # ==================================================
-                # TP2
-                # ==================================================
 
-                if (
-                    trade["tp1_hit"]
-                    and not trade[
-                        "tp2_hit"
-                    ]
-                ):
+# ============================================================
+# /SCAN
+# ============================================================
 
-                    tp2_reached = (
+async def scan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-                        price
-                        >= trade["tp2"]
+    await update.message.reply_text(
+        "🔎 *Scanning XAU/USD...*\n\n"
+        "Please wait...",
+        parse_mode="Markdown",
+    )
 
-                        if side == "BUY"
+    await scan_market(
+        context,
+        force=True,
+    )
 
-                        else
 
-                        price
-                        <= trade["tp2"]
-                    )
+# ============================================================
+# /TRADE
+# ============================================================
 
-                    if tp2_reached:
+async def trade_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-                        trade[
-                            "tp2_hit"
-                        ] = True
+    if not active_trade:
 
-                        if side == "BUY":
+        await update.message.reply_text(
+            "📭 *No active GOLD trade.*",
+            parse_mode="Markdown",
+        )
 
-                            trade[
-                                "sl"
-                            ] = max(
-                                trade["sl"],
-                                trade["tp1"]
-                            )
+        return
 
-                        else:
+    trade = active_trade
 
-                            trade[
-                                "sl"
-                            ] = min(
-                                trade["sl"],
-                                trade["tp1"]
-                            )
+    message = (
+        "👑 *ACTIVE XAU/USD TRADE* 👑\n\n"
 
-                        changed = True
+        f"Direction: *{trade['signal']}*\n\n"
 
-                        await send_chat_message(
-                            context,
-                            (
-                                f"🏆 *TP2 HIT — "
-                                f"{side}*\n\n"
+        f"Entry: `${trade['entry']:,.2f}`\n"
 
-                                f"💰 Price: "
-                                f"`${price:,.2f}`\n"
+        f"SL: `${trade['sl']:,.2f}`\n\n"
 
-                                f"🛡️ Protected SL: "
-                                f"`${trade['sl']:,.2f}`\n"
+        f"TP1: `${trade['tp1']:,.2f}`\n"
 
-                                "📈 Trailing "
-                                "protection active."
-                            )
-                        )
+        f"TP2: `${trade['tp2']:,.2f}`\n"
 
-                # ==================================================
-                # TRAILING
-                # ==================================================
+        f"TP3: `${trade['tp3']:,.2f}`\n\n"
 
-                if (
-                    trade["tp2_hit"]
-                    and not trade[
-                        "tp3_hit"
-                    ]
-                ):
+        f"TP1 hit: "
+        f"{'✅' if trade['tp1_hit'] else '⏳'}\n"
 
-                    distance = (
-                        abs(
-                            trade["tp3"]
-                            - trade["tp2"]
-                        )
-                        * 0.50
-                    )
+        f"TP2 hit: "
+        f"{'✅' if trade['tp2_hit'] else '⏳'}\n"
 
-                    if side == "BUY":
+        f"TP3 hit: "
+        f"{'✅' if trade['tp3_hit'] else '⏳'}"
+    )
 
-                        new_sl = (
-                            price
-                            - distance
-                        )
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+    )
 
-                        if (
-                            new_sl
-                            > trade["sl"]
-                        ):
 
-                            trade[
-                                "sl"
-                            ] = new_sl
+# ============================================================
+# ERROR HANDLER
+# ============================================================
 
-                            changed = True
+async def error_handler(
+    update,
+    context,
+):
 
-                    else:
+    logger.error(
+        "Telegram error: %s",
+        context.error,
+    )
 
-                        new_sl = (
-                            price
-                            + distance
-                        )
 
-                        if (
-                            new_sl
-                            < trade["sl"]
-                        ):
+# ============================================================
+# START TELEGRAM APPLICATION
+# ============================================================
 
-                            trade[
-                                "sl"
-                            ] = new_sl
+async def start_bot():
 
-                            changed = True
+    global bot_application
 
-                # ==================================================
-                # TP3
-                # ==================================================
+    if not TELEGRAM_BOT_TOKEN:
 
-                if not trade[
-                    "tp3_hit"
-                ]:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing."
+        )
 
-                    tp3_reached = (
+    if not TWELVE_DATA_API_KEY:
 
-                        price
-                        >= trade["tp3"]
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY is missing."
+        )
 
-                        if side == "BUY"
+    logger.info(
+        "Starting %s",
+        BOT_NAME,
+    )
 
-                        else
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
 
-                        price
-                        <= trade["tp3"]
-                    )
+    bot_application = application
 
-                                        if tp3_reached:
+    # ========================================================
+    # COMMANDS
+    # ========================================================
 
-                        trade[
-                            "tp3_hit"
-                        ] = True
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
 
-                        trade[
-                            "status"
-                        ] = "TP3"
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status_command,
+        )
+    )
 
-                        trade[
-                            "exit_price"
-                        ] = price
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan_command,
+        )
+    )
 
-                        trade[
-                            "closed_at"
-                        ] = (
-                            datetime.now(
-                                timezone.utc
-                            ).isoformat()
-                        )
+    application.add_handler(
+        CommandHandler(
+            "trade",
+            trade_command,
+        )
+    )
 
-                        changed = True
+    application.add_error_handler(
+        error_handler
+    )
 
-                        await send_chat_message(
-                            context,
-                            (
-                                "👑 *TP3 HIT — TRADE COMPLETE*\n\n"
-                                f"🟡 XAU/USD {side}\n"
-                                f"💰 Exit: `${price:,.2f}`\n"
-                                "🏆 Full target reached.\n"
-                                "✅ Trade closed successfully."
-                            )
-                        )
+    # ========================================================
+    # START
+    # ========================================================
+
+    await application.initialize()
+
+    await application.start()
+
+    await application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+    logger.info(
+        "Telegram polling started."
+    )
+
+    # ========================================================
+    # BACKGROUND MARKET SCANNER
+    # ========================================================
+
+    monitor_task = asyncio.create_task(
+        background_monitor(
+            application
+        )
+    )
+
+    try:
+
+        while not stop_event.is_set():
+
+            await asyncio.sleep(1)
+
+    finally:
+
+        logger.info(
+            "Stopping bot..."
+        )
+
+        monitor_task.cancel()
+
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+        await application.updater.stop()
+
+        await application.stop()
+
+        await application.shutdown()
+
+        logger.info(
+            "Bot shutdown complete."
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    # Flask health server
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True,
+        name="FlaskServer",
+    )
+
+    flask_thread.start()
+
+    logger.info(
+        "Flask server started on port %s",
+        PORT,
+    )
+
+    try:
+
+        asyncio.run(
+            start_bot()
+        )
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Keyboard interrupt received."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Fatal error: %s",
+            e,
+        )
+
+    finally:
+
+        stop_event.set()
+
+        logger.info(
+            "KING OF XAU_NAS stopped."
+        )
+
+
+if __name__ == "__main__":
+    main()
