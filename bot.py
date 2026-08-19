@@ -2480,7 +2480,7 @@ async def monitor_trades(
                         <= trade["tp3"]
                     )
 
-                    if tp3_reached:
+                                        if tp3_reached:
 
                         trade[
                             "tp3_hit"
@@ -2505,12 +2505,12 @@ async def monitor_trades(
                         changed = True
 
                         await send_chat_message(
-    context,
-    (
-        "👑 *TP3 HIT — TRADE COMPLETE*\n\n"
-        f"🟡 XAU/USD {side}\n"
-        f"💰 Exit: `${price:,.2f}`\n"
-        "🏆 Full target reached.\n"
-        "✅ Trade closed successfully."
-    )
-)
+                            context,
+                            (
+                                "👑 *TP3 HIT — TRADE COMPLETE*\n\n"
+                                f"🟡 XAU/USD {side}\n"
+                                f"💰 Exit: `${price:,.2f}`\n"
+                                "🏆 Full target reached.\n"
+                                "✅ Trade closed successfully."
+                            )
+                        )
