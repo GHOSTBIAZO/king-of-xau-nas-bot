@@ -3,7 +3,7 @@ import json
 import time
 import asyncio
 import logging
-from threading import Thread
+from threading import Thread, Lock
 from datetime import datetime, timezone
 
 import requests
@@ -17,29 +17,80 @@ from telegram.ext import (
 )
 
 # ============================================================
-# 👑 KING OF XAU_NAS — FULL MULTI-MARKET TELEGRAM BOT
+# 👑 KING OF XAU_NAS
+# RATE-LIMIT-SAFE MULTI-MARKET TELEGRAM BOT
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
 
-PORT = int(os.getenv("PORT", "10000"))
+TWELVE_DATA_API_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY",
+    ""
+).strip()
 
-TIMEFRAME = os.getenv("INTERVAL", "15min")
-OUTPUT_SIZE = int(os.getenv("OUTPUT_SIZE", "200"))
+PORT = int(
+    os.getenv("PORT", "10000")
+)
+
+TIMEFRAME = os.getenv(
+    "INTERVAL",
+    "15min"
+)
+
+OUTPUT_SIZE = int(
+    os.getenv("OUTPUT_SIZE", "100")
+)
+
+# ============================================================
+# RATE LIMIT SETTINGS
+# ============================================================
+
+# Automatic full scan every 5 minutes.
+AUTO_SCAN_SECONDS = int(
+    os.getenv(
+        "AUTO_SCAN_SECONDS",
+        "300"
+    )
+)
+
+# Minimum time between Twelve Data requests.
+REQUEST_GAP_SECONDS = float(
+    os.getenv(
+        "REQUEST_GAP_SECONDS",
+        "5"
+    )
+)
+
+# If Twelve Data returns 429, don't request again
+# until this cooldown expires.
+RATE_LIMIT_COOLDOWN_SECONDS = int(
+    os.getenv(
+        "RATE_LIMIT_COOLDOWN_SECONDS",
+        "120"
+    )
+)
+
+# ============================================================
+# SIGNAL SETTINGS
+# ============================================================
 
 NORMAL_CONFIDENCE = int(
-    os.getenv("NORMAL_CONFIDENCE", "70")
+    os.getenv(
+        "NORMAL_CONFIDENCE",
+        "70"
+    )
 )
 
 SCALP_CONFIDENCE = int(
-    os.getenv("SCALP_CONFIDENCE", "60")
-)
-
-SCAN_SECONDS = int(
-    os.getenv("SCAN_SECONDS", "60")
+    os.getenv(
+        "SCALP_CONFIDENCE",
+        "60"
+    )
 )
 
 CHAT_ID_FILE = "telegram_chat_id.json"
@@ -94,11 +145,23 @@ MODE = "NORMAL"
 
 CHAT_ID = None
 
+SCANNER_RUNNING = False
+
 LAST_SIGNALS = {}
 
 LATEST_RESULTS = {}
 
-SCANNER_RUNNING = False
+# Market dataframe cache.
+DATA_CACHE = {}
+
+# Timestamp of last successful API request.
+LAST_API_REQUEST = 0.0
+
+# When > current time, API calls are paused.
+RATE_LIMIT_UNTIL = 0.0
+
+# Prevent simultaneous API requests.
+API_LOCK = Lock()
 
 # ============================================================
 # LOGGING
@@ -106,10 +169,16 @@ SCANNER_RUNNING = False
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format=(
+        "%(asctime)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
 )
 
-logger = logging.getLogger("KING_OF_XAU_NAS")
+logger = logging.getLogger(
+    "KING_OF_XAU_NAS"
+)
 
 # ============================================================
 # FLASK / RENDER
@@ -120,19 +189,34 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "KING OF XAU_NAS ONLINE"
+
+    return (
+        "KING OF XAU_NAS ONLINE"
+    )
 
 
 @app.route("/health")
 def health():
 
+    cooldown = max(
+        0,
+        int(
+            RATE_LIMIT_UNTIL -
+            time.time()
+        ),
+    )
+
     return {
         "status": "online",
         "bot": BOT_NAME,
         "mode": MODE,
+        "scanner": SCANNER_RUNNING,
         "markets": len(MARKETS),
         "timeframe": TIMEFRAME,
-        "scanner": SCANNER_RUNNING,
+        "cached_markets": len(
+            DATA_CACHE
+        ),
+        "rate_limit_cooldown": cooldown,
     }
 
 
@@ -152,7 +236,9 @@ def load_chat_id():
 
     try:
 
-        if os.path.exists(CHAT_ID_FILE):
+        if os.path.exists(
+            CHAT_ID_FILE
+        ):
 
             with open(
                 CHAT_ID_FILE,
@@ -160,9 +246,13 @@ def load_chat_id():
                 encoding="utf-8",
             ) as file:
 
-                data = json.load(file)
+                data = json.load(
+                    file
+                )
 
-                return data.get("chat_id")
+                return data.get(
+                    "chat_id"
+                )
 
     except Exception as error:
 
@@ -186,13 +276,15 @@ def save_chat_id(chat_id):
 
             json.dump(
                 {
-                    "chat_id": str(chat_id)
+                    "chat_id": str(
+                        chat_id
+                    )
                 },
                 file,
             )
 
         logger.info(
-            "Chat ID saved: %s",
+            "Telegram Chat ID saved: %s",
             chat_id,
         )
 
@@ -207,7 +299,7 @@ def save_chat_id(chat_id):
 CHAT_ID = load_chat_id()
 
 # ============================================================
-# TELEGRAM SEND
+# TELEGRAM
 # ============================================================
 
 async def send_telegram(
@@ -216,7 +308,10 @@ async def send_telegram(
     chat_id=None,
 ):
 
-    target = chat_id or CHAT_ID
+    target = (
+        chat_id
+        or CHAT_ID
+    )
 
     if not target:
 
@@ -234,7 +329,8 @@ async def send_telegram(
         # No HTML.
         #
         # This prevents:
-        # BadRequest: can't parse entities
+        # BadRequest:
+        # can't parse entities
 
         await application.bot.send_message(
             chat_id=target,
@@ -246,7 +342,7 @@ async def send_telegram(
     except Exception as error:
 
         logger.error(
-            "Telegram error: %s",
+            "Telegram send error: %s",
             error,
         )
 
@@ -274,7 +370,9 @@ async def start_command(
         update.effective_chat.id
     )
 
-    save_chat_id(CHAT_ID)
+    save_chat_id(
+        CHAT_ID
+    )
 
     message = (
         "👑 KING OF XAU_NAS\n"
@@ -282,7 +380,7 @@ async def start_command(
         "🟢 BOT ONLINE\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "Telegram Chat ID saved successfully.\n\n"
+        "Telegram Chat ID saved.\n\n"
 
         "📊 MARKETS\n"
         "🟡 XAU/USD — Gold\n"
@@ -296,13 +394,13 @@ async def start_command(
         f"⏱ Timeframe: {TIMEFRAME}\n\n"
 
         "COMMANDS\n"
-        "/status — bot status\n"
-        "/watchlist — markets\n"
-        "/scan — normal scan now\n"
-        "/scalp — scalp scan now\n"
-        "/normal — normal mode\n"
-        "/signals — latest results\n"
-        "/start — register chat\n\n"
+        "/status\n"
+        "/watchlist\n"
+        "/scan\n"
+        "/scalp\n"
+        "/normal\n"
+        "/signals\n"
+        "/start\n\n"
 
         "👑 KING OF XAU_NAS READY."
     )
@@ -324,6 +422,14 @@ async def status_command(
     if not update.message:
         return
 
+    cooldown = max(
+        0,
+        int(
+            RATE_LIMIT_UNTIL -
+            time.time()
+        ),
+    )
+
     message = (
         "👑 KING OF XAU_NAS — STATUS\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -331,23 +437,25 @@ async def status_command(
         "🟢 Telegram: CONNECTED\n"
         "🟢 Bot: ONLINE\n"
         "🟢 Scanner: RUNNING\n"
-        "🟢 Market Engine: ACTIVE\n\n"
+        "🟢 Signal Engine: ACTIVE\n\n"
 
         f"⚙️ Mode: {MODE}\n"
         f"⏱ Timeframe: {TIMEFRAME}\n"
-        f"📊 Markets: {len(MARKETS)}\n"
-        f"🎯 Normal threshold: "
+        f"📊 Markets: {len(MARKETS)}\n\n"
+
+        f"🎯 Normal: "
         f"{NORMAL_CONFIDENCE}%\n"
-        f"⚡ Scalp threshold: "
+
+        f"⚡ Scalp: "
         f"{SCALP_CONFIDENCE}%\n\n"
 
-        "Markets monitored:\n"
-        "🟡 XAU/USD\n"
-        "📈 US100\n"
-        "🏛️ US30\n"
-        "🇬🇧 GBP/USD\n"
-        "💷 GBP/JPY\n"
-        "🇪🇺 EUR/USD"
+        f"💾 Cached markets: "
+        f"{len(DATA_CACHE)}\n"
+
+        f"⏳ API cooldown: "
+        f"{cooldown}s\n\n"
+
+        "🛡 Rate-limit protection: ACTIVE"
     )
 
     await update.message.reply_text(
@@ -374,7 +482,14 @@ async def watchlist_command(
 
     for symbol, info in MARKETS.items():
 
+        cache_status = (
+            "💾"
+            if symbol in DATA_CACHE
+            else "⏳"
+        )
+
         lines.append(
+            f"{cache_status} "
             f"{info['emoji']} "
             f"{symbol} — "
             f"{info['name']}"
@@ -383,7 +498,7 @@ async def watchlist_command(
     lines.extend(
         [
             "━━━━━━━━━━━━━━━━━━━━",
-            f"⚙️ Current mode: {MODE}",
+            f"⚙️ Mode: {MODE}",
             f"⏱ Timeframe: {TIMEFRAME}",
         ]
     )
@@ -414,10 +529,10 @@ async def normal_command(
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🟢 NORMAL MODE ACTIVATED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 Confidence threshold: "
+        f"🎯 Threshold: "
         f"{NORMAL_CONFIDENCE}%\n"
         f"⏱ Timeframe: {TIMEFRAME}\n\n"
-        "Normal scanning will continue automatically."
+        "Automatic scanning continues."
     )
 
 
@@ -442,17 +557,22 @@ async def scalp_command(
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ SCALPING MODE ACTIVATED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 Confidence threshold: "
+        f"🎯 Threshold: "
         f"{SCALP_CONFIDENCE}%\n"
         f"⏱ Timeframe: {TIMEFRAME}\n\n"
-        "⚡ Faster setups enabled.\n"
-        "⚠️ Scalping carries higher risk."
+        "⚡ Using cached market data "
+        "where available.\n"
+        "🛡 Rate-limit protection active."
     )
 
-    # Immediately scan after switching.
+    # Do NOT immediately make six new
+    # API requests here.
+    #
+    # We run the engine using cached data
+    # first.
 
     asyncio.create_task(
-        manual_scan(
+        cached_scan(
             context.application,
             "SCALP",
         )
@@ -478,13 +598,15 @@ async def scan_command(
     await update.message.reply_text(
         "🔎 KING OF XAU_NAS\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📡 NORMAL SCAN STARTED\n"
+        "📡 NORMAL SCAN REQUESTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Scanning all markets..."
+        "Using cached data first.\n"
+        "Twelve Data requests are "
+        "rate-limit protected."
     )
 
     asyncio.create_task(
-        manual_scan(
+        cached_scan(
             context.application,
             "NORMAL",
         )
@@ -507,8 +629,8 @@ async def signals_command(
 
         await update.message.reply_text(
             "👑 KING OF XAU_NAS\n\n"
-            "No market results yet.\n"
-            "Use /scan to start a scan."
+            "No scan results yet.\n\n"
+            "Use /scan to begin."
         )
 
         return
@@ -520,8 +642,10 @@ async def signals_command(
 
     for symbol in MARKETS:
 
-        result = LATEST_RESULTS.get(
-            symbol
+        result = (
+            LATEST_RESULTS.get(
+                symbol
+            )
         )
 
         if not result:
@@ -539,7 +663,7 @@ async def signals_command(
 
 
 # ============================================================
-# ERROR HANDLER
+# TELEGRAM ERROR HANDLER
 # ============================================================
 
 async def error_handler(
@@ -554,95 +678,252 @@ async def error_handler(
 
 
 # ============================================================
-# DATA FETCH
+# RATE-LIMIT SAFE API WAIT
 # ============================================================
 
-def fetch_market_data(symbol):
+def wait_for_api_slot():
+
+    global LAST_API_REQUEST
+
+    now = time.time()
+
+    # 429 cooldown.
+
+    if now < RATE_LIMIT_UNTIL:
+
+        return False
+
+    elapsed = (
+        now -
+        LAST_API_REQUEST
+    )
+
+    if (
+        elapsed <
+        REQUEST_GAP_SECONDS
+    ):
+
+        time.sleep(
+            REQUEST_GAP_SECONDS -
+            elapsed
+        )
+
+    LAST_API_REQUEST = time.time()
+
+    return True
+
+
+# ============================================================
+# TWELVE DATA FETCH
+# ============================================================
+
+def fetch_market_data(
+    symbol,
+):
+
+    global RATE_LIMIT_UNTIL
 
     if not TWELVE_DATA_API_KEY:
 
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY is missing."
+            "TWELVE_DATA_API_KEY "
+            "is missing."
         )
 
-    response = requests.get(
-        "https://api.twelvedata.com/time_series",
-        params={
-            "symbol": symbol,
-            "interval": TIMEFRAME,
-            "outputsize": OUTPUT_SIZE,
-            "apikey": TWELVE_DATA_API_KEY,
-        },
-        timeout=20,
-    )
+    # Serialize all Twelve Data calls.
 
-    response.raise_for_status()
+    with API_LOCK:
 
-    data = response.json()
-
-    if "values" not in data:
-
-        raise RuntimeError(
-            data.get(
-                "message",
-                f"No data returned for {symbol}",
-            )
-        )
-
-    df = pd.DataFrame(
-        data["values"]
-    )
-
-    required = [
-        "datetime",
-        "open",
-        "high",
-        "low",
-        "close",
-    ]
-
-    for column in required:
-
-        if column not in df.columns:
+        if not wait_for_api_slot():
 
             raise RuntimeError(
-                f"{symbol}: missing {column}"
+                "Twelve Data temporarily "
+                "rate-limited. "
+                "Using cached data."
             )
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-    ]:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
+        logger.info(
+            "Twelve Data request → %s",
+            symbol,
         )
 
-    df = df.dropna(
-        subset=[
+        try:
+
+            response = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol": symbol,
+                    "interval": TIMEFRAME,
+                    "outputsize": OUTPUT_SIZE,
+                    "apikey": TWELVE_DATA_API_KEY,
+                },
+                timeout=20,
+            )
+
+        except Exception:
+
+            raise
+
+        # ----------------------------------------------------
+        # 429 HANDLING
+        # ----------------------------------------------------
+
+        if response.status_code == 429:
+
+            RATE_LIMIT_UNTIL = (
+                time.time()
+                +
+                RATE_LIMIT_COOLDOWN_SECONDS
+            )
+
+            logger.warning(
+                "🚨 Twelve Data 429. "
+                "Pausing API requests for "
+                "%s seconds.",
+                RATE_LIMIT_COOLDOWN_SECONDS,
+            )
+
+            raise RuntimeError(
+                "Twelve Data HTTP 429 "
+                "Too Many Requests"
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if "values" not in data:
+
+            message = data.get(
+                "message",
+                "No market data returned",
+            )
+
+            raise RuntimeError(
+                message
+            )
+
+        df = pd.DataFrame(
+            data["values"]
+        )
+
+        required = [
+            "datetime",
             "open",
             "high",
             "low",
             "close",
         ]
-    )
 
-    df = (
-        df
-        .iloc[::-1]
-        .reset_index(drop=True)
-    )
+        missing = [
+            column
+            for column in required
+            if column not in df.columns
+        ]
 
-    if len(df) < 60:
+        if missing:
 
-        raise RuntimeError(
-            f"{symbol}: insufficient candles"
+            raise RuntimeError(
+                f"{symbol}: missing "
+                f"{missing}"
+            )
+
+        for column in [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]:
+
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+        df = df.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
         )
 
-    return df
+        df = (
+            df
+            .iloc[::-1]
+            .reset_index(drop=True)
+        )
+
+        if len(df) < 60:
+
+            raise RuntimeError(
+                f"{symbol}: only "
+                f"{len(df)} candles"
+            )
+
+        # Store in cache.
+
+        DATA_CACHE[symbol] = {
+            "data": df,
+            "timestamp": time.time(),
+        }
+
+        logger.info(
+            "Cached %s successfully.",
+            symbol,
+        )
+
+        return df
+
+
+# ============================================================
+# GET DATA — CACHE FIRST
+# ============================================================
+
+def get_market_data(
+    symbol,
+    force_refresh=False,
+):
+
+    cached = DATA_CACHE.get(
+        symbol
+    )
+
+    # Use cache unless refresh was
+    # specifically requested.
+
+    if cached and not force_refresh:
+
+        logger.info(
+            "%s → using cached data",
+            symbol,
+        )
+
+        return cached["data"]
+
+    try:
+
+        return fetch_market_data(
+            symbol
+        )
+
+    except Exception as error:
+
+        # If API fails, use old cache.
+
+        if cached:
+
+            logger.warning(
+                "%s → API unavailable; "
+                "using cached data: %s",
+                symbol,
+                error,
+            )
+
+            return cached["data"]
+
+        raise
 
 
 # ============================================================
@@ -653,6 +934,8 @@ def add_indicators(df):
 
     df = df.copy()
 
+    # EMA 20
+
     df["ema20"] = (
         df["close"]
         .ewm(
@@ -662,6 +945,8 @@ def add_indicators(df):
         .mean()
     )
 
+    # EMA 50
+
     df["ema50"] = (
         df["close"]
         .ewm(
@@ -670,6 +955,8 @@ def add_indicators(df):
         )
         .mean()
     )
+
+    # RSI 14
 
     delta = df["close"].diff()
 
@@ -709,14 +996,18 @@ def add_indicators(df):
 
     df["rsi"] = (
         100 -
-        100 /
-        (1 + rs)
+        (
+            100 /
+            (1 + rs)
+        )
     )
 
     df["rsi"] = (
         df["rsi"]
         .fillna(50)
     )
+
+    # ATR 14
 
     previous_close = (
         df["close"]
@@ -760,10 +1051,13 @@ def add_indicators(df):
 
 
 # ============================================================
-# PRICE ACTION
+# BOS
 # ============================================================
 
 def detect_bos(df):
+
+    if len(df) < 10:
+        return None
 
     previous_high = (
         df["high"]
@@ -780,30 +1074,56 @@ def detect_bos(df):
     last = df.iloc[-1]
 
     if last["close"] > previous_high:
+
         return "BUY"
 
     if last["close"] < previous_low:
+
         return "SELL"
 
     return None
 
 
+# ============================================================
+# CHOCH
+# ============================================================
+
 def detect_choch(df):
+
+    if len(df) < 10:
+        return None
 
     recent = df.iloc[-8:-1]
 
     last = df.iloc[-1]
 
-    if last["close"] > recent["high"].max():
+    if (
+        last["close"]
+        >
+        recent["high"].max()
+    ):
+
         return "BUY"
 
-    if last["close"] < recent["low"].min():
+    if (
+        last["close"]
+        <
+        recent["low"].min()
+    ):
+
         return "SELL"
 
     return None
 
 
+# ============================================================
+# LIQUIDITY
+# ============================================================
+
 def detect_liquidity(df):
+
+    if len(df) < 20:
+        return None
 
     recent = df.iloc[-16:-1]
 
@@ -817,6 +1137,7 @@ def detect_liquidity(df):
         and
         last["close"] < high
     ):
+
         return "SELL"
 
     if (
@@ -824,12 +1145,20 @@ def detect_liquidity(df):
         and
         last["close"] > low
     ):
+
         return "BUY"
 
     return None
 
 
+# ============================================================
+# FVG
+# ============================================================
+
 def detect_fvg(df):
+
+    if len(df) < 5:
+        return None
 
     c1 = df.iloc[-3]
     c2 = df.iloc[-2]
@@ -840,6 +1169,7 @@ def detect_fvg(df):
         and
         c2["close"] > c2["open"]
     ):
+
         return "BUY"
 
     if (
@@ -847,20 +1177,35 @@ def detect_fvg(df):
         and
         c2["close"] < c2["open"]
     ):
+
         return "SELL"
 
     return None
 
+
+# ============================================================
+# MOMENTUM
+# ============================================================
 
 def detect_momentum(df):
 
     last = df.iloc[-1]
     previous = df.iloc[-2]
 
-    if last["close"] > previous["close"]:
+    if (
+        last["close"]
+        >
+        previous["close"]
+    ):
+
         return "BUY"
 
-    if last["close"] < previous["close"]:
+    if (
+        last["close"]
+        <
+        previous["close"]
+    ):
+
         return "SELL"
 
     return None
@@ -897,10 +1242,22 @@ def calculate_signal(
         last["atr"]
     )
 
+    if atr <= 0:
+
+        return (
+            None,
+            0,
+            "Invalid ATR",
+        )
+
     bos = detect_bos(df)
+
     choch = detect_choch(df)
+
     liquidity = detect_liquidity(df)
+
     fvg = detect_fvg(df)
+
     momentum = detect_momentum(df)
 
     buy = 0
@@ -911,9 +1268,11 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if ema20 > ema50:
+
         buy += 20
 
     elif ema20 < ema50:
+
         sell += 20
 
     # --------------------------------------------------------
@@ -921,9 +1280,11 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if 52 <= rsi <= 72:
+
         buy += 15
 
     elif 28 <= rsi <= 48:
+
         sell += 15
 
     # --------------------------------------------------------
@@ -931,9 +1292,11 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if bos == "BUY":
+
         buy += 15
 
     elif bos == "SELL":
+
         sell += 15
 
     # --------------------------------------------------------
@@ -941,9 +1304,11 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if choch == "BUY":
+
         buy += 15
 
     elif choch == "SELL":
+
         sell += 15
 
     # --------------------------------------------------------
@@ -951,9 +1316,11 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if fvg == "BUY":
+
         buy += 15
 
     elif fvg == "SELL":
+
         sell += 15
 
     # --------------------------------------------------------
@@ -961,9 +1328,11 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if liquidity == "BUY":
+
         buy += 10
 
     elif liquidity == "SELL":
+
         sell += 10
 
     # --------------------------------------------------------
@@ -971,13 +1340,15 @@ def calculate_signal(
     # --------------------------------------------------------
 
     if momentum == "BUY":
+
         buy += 10
 
     elif momentum == "SELL":
+
         sell += 10
 
     # --------------------------------------------------------
-    # MODE THRESHOLD
+    # THRESHOLD
     # --------------------------------------------------------
 
     if mode == "SCALP":
@@ -1003,70 +1374,73 @@ def calculate_signal(
         return (
             None,
             confidence,
-            f"{side} candidate {confidence}% "
-            f"(threshold {threshold}%)",
+            (
+                f"{side} candidate "
+                f"{confidence}% "
+                f"(needs {threshold}%)"
+            ),
         )
 
     # --------------------------------------------------------
-    # TARGETS
+    # TARGET MULTIPLIERS
     # --------------------------------------------------------
 
     if mode == "SCALP":
 
-        sl_multiplier = 1.0
-        tp1_multiplier = 1.2
-        tp2_multiplier = 1.8
-        tp3_multiplier = 2.5
+        sl_mult = 1.0
+        tp1_mult = 1.2
+        tp2_mult = 1.8
+        tp3_mult = 2.5
 
     else:
 
-        sl_multiplier = 1.5
-        tp1_multiplier = 2.0
-        tp2_multiplier = 3.0
-        tp3_multiplier = 5.0
+        sl_mult = 1.5
+        tp1_mult = 2.0
+        tp2_mult = 3.0
+        tp3_mult = 5.0
 
     if side == "BUY":
 
         sl = (
             price -
-            atr * sl_multiplier
+            atr * sl_mult
         )
 
         tp1 = (
             price +
-            atr * tp1_multiplier
+            atr * tp1_mult
         )
 
         tp2 = (
             price +
-            atr * tp2_multiplier
+            atr * tp2_mult
         )
 
         tp3 = (
             price +
-            atr * tp3_multiplier
+            atr * tp3_mult
         )
 
     else:
 
         sl = (
             price +
-            atr * sl_multiplier
+            atr * sl_mult
         )
 
         tp1 = (
             price -
-            atr * tp1_multiplier
+            atr * tp1_mult
         )
 
         tp2 = (
             price -
-            atr * tp2_multiplier
+            atr * tp2_mult
         )
 
         tp3 = (
             price -
-            atr * tp3_multiplier
+            atr * tp3_mult
         )
 
     signal = {
@@ -1115,7 +1489,7 @@ def fmt(
 
 
 # ============================================================
-# BUILD SIGNAL
+# SIGNAL MESSAGE
 # ============================================================
 
 def build_signal_message(
@@ -1127,7 +1501,7 @@ def build_signal_message(
 
     side = signal["side"]
 
-    arrow = (
+    direction = (
         "🟢"
         if side == "BUY"
         else "🔴"
@@ -1141,12 +1515,13 @@ def build_signal_message(
         )
     )
 
-    def check(value):
+    def mark(value):
 
-        if value == side:
-            return "✅"
-
-        return "—"
+        return (
+            "✅"
+            if value == side
+            else "—"
+        )
 
     return (
         "👑 KING OF XAU_NAS\n"
@@ -1155,7 +1530,7 @@ def build_signal_message(
         f"{info['name']}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
 
-        f"{arrow} "
+        f"{direction} "
         f"SIGNAL CONFIRMED — "
         f"{side}\n"
 
@@ -1199,19 +1574,19 @@ def build_signal_message(
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"🏗 BOS: "
-        f"{check(signal['bos'])}\n"
+        f"{mark(signal['bos'])}\n"
 
         f"🔄 CHoCH: "
-        f"{check(signal['choch'])}\n"
+        f"{mark(signal['choch'])}\n"
 
         f"💧 Liquidity: "
-        f"{check(signal['liquidity'])}\n"
+        f"{mark(signal['liquidity'])}\n"
 
         f"📦 FVG: "
-        f"{check(signal['fvg'])}\n"
+        f"{mark(signal['fvg'])}\n"
 
         f"⚡ Momentum: "
-        f"{check(signal['momentum'])}\n"
+        f"{mark(signal['momentum'])}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
@@ -1226,19 +1601,18 @@ def build_signal_message(
 
 
 # ============================================================
-# ANALYZE MARKET
+# ANALYZE USING CACHE
 # ============================================================
 
 async def analyze_market(
     application,
     symbol,
     mode,
-    send_signal=True,
 ):
 
     try:
 
-        df = fetch_market_data(
+        df = get_market_data(
             symbol
         )
 
@@ -1275,7 +1649,9 @@ async def analyze_market(
 
         if not signal:
 
-            LATEST_RESULTS[symbol] = {
+            LATEST_RESULTS[
+                symbol
+            ] = {
                 "emoji": MARKETS[
                     symbol
                 ]["emoji"],
@@ -1295,7 +1671,9 @@ async def analyze_market(
             f"{signal['side']}"
         )
 
-        LATEST_RESULTS[symbol] = {
+        LATEST_RESULTS[
+            symbol
+        ] = {
             "emoji": MARKETS[
                 symbol
             ]["emoji"],
@@ -1305,65 +1683,64 @@ async def analyze_market(
             ),
         }
 
-        # Prevent duplicate Telegram alerts.
-
         if (
-            LAST_SIGNALS.get(symbol)
+            LAST_SIGNALS.get(
+                symbol
+            )
             ==
             signal_key
         ):
 
             logger.info(
-                "%s → duplicate signal skipped",
+                "%s → duplicate "
+                "signal skipped",
                 symbol,
             )
 
             return signal
 
-        LAST_SIGNALS[symbol] = (
-            signal_key
+        LAST_SIGNALS[
+            symbol
+        ] = signal_key
+
+        message = (
+            build_signal_message(
+                symbol,
+                signal,
+            )
         )
 
-        if send_signal:
+        await send_telegram(
+            application,
+            message,
+        )
 
-            message = (
-                build_signal_message(
-                    symbol,
-                    signal,
-                )
-            )
-
-            sent = await send_telegram(
-                application,
-                message,
-            )
-
-            if sent:
-
-                logger.info(
-                    "%s → %s SIGNAL SENT "
-                    "%s%%",
-                    symbol,
-                    signal["side"],
-                    confidence,
-                )
+        logger.info(
+            "%s → %s SIGNAL SENT "
+            "at %s%%",
+            symbol,
+            signal["side"],
+            confidence,
+        )
 
         return signal
 
     except Exception as error:
 
         logger.warning(
-            "%s → DATA/SCAN ERROR: %s",
+            "%s → scan unavailable: %s",
             symbol,
             error,
         )
 
-        LATEST_RESULTS[symbol] = {
+        LATEST_RESULTS[
+            symbol
+        ] = {
             "emoji": MARKETS[
                 symbol
             ]["emoji"],
             "text": (
-                f"ERROR: {error}"
+                "Waiting for market data"
             ),
         }
 
@@ -1371,20 +1748,90 @@ async def analyze_market(
 
 
 # ============================================================
-# MANUAL SCAN
+# REFRESH DATA
+#
+# IMPORTANT:
+# This is the ONLY place the automatic scanner
+# intentionally requests fresh Twelve Data data.
 # ============================================================
 
-async def manual_scan(
-    application,
-    mode,
-):
+async def refresh_all_markets():
 
     logger.info(
-        "=============================================="
+        "Starting rate-limit-safe "
+        "market refresh..."
     )
 
+    refreshed = 0
+
+    for symbol in MARKETS:
+
+        # If a 429 cooldown is active,
+        # stop making requests.
+
+        if time.time() < RATE_LIMIT_UNTIL:
+
+            logger.warning(
+                "API cooldown active. "
+                "Stopping refresh."
+            )
+
+            break
+
+        try:
+
+            await asyncio.to_thread(
+                fetch_market_data,
+                symbol,
+            )
+
+            refreshed += 1
+
+        except Exception as error:
+
+            logger.warning(
+                "%s refresh failed: %s",
+                symbol,
+                error,
+            )
+
+            # If 429 happened, stop immediately.
+
+            if time.time() < RATE_LIMIT_UNTIL:
+
+                break
+
+        # Gap between API calls.
+
+        await asyncio.sleep(
+            REQUEST_GAP_SECONDS
+        )
+
     logger.info(
-        "MANUAL %s SCAN STARTED",
+        "Market refresh complete: "
+        "%s/%s markets",
+        refreshed,
+        len(MARKETS),
+    )
+
+
+# ============================================================
+# FULL SCAN
+# ============================================================
+
+async def full_scan(
+    application,
+    mode,
+    refresh=True,
+):
+
+    if refresh:
+
+        await refresh_all_markets()
+
+    logger.info(
+        "Running %s signal engine "
+        "using cached data...",
         mode,
     )
 
@@ -1396,20 +1843,56 @@ async def manual_scan(
             application,
             symbol,
             mode,
-            send_signal=True,
         )
 
         if signal:
+
             found += 1
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(
+            0.2
+        )
 
     logger.info(
-        "%s scan finished. "
-        "Signals: %s",
+        "%s signal scan complete. "
+        "Signals=%s",
         mode,
         found,
     )
+
+
+# ============================================================
+# CACHED SCAN
+# ============================================================
+
+async def cached_scan(
+    application,
+    mode,
+):
+
+    # First use existing cache.
+
+    await full_scan(
+        application,
+        mode,
+        refresh=False,
+    )
+
+    # If there is no cache at all,
+    # perform one controlled refresh.
+
+    if not DATA_CACHE:
+
+        logger.info(
+            "No cached data available. "
+            "Performing controlled refresh."
+        )
+
+        await full_scan(
+            application,
+            mode,
+            refresh=True,
+        )
 
 
 # ============================================================
@@ -1425,11 +1908,11 @@ async def scanner_loop(
     SCANNER_RUNNING = True
 
     logger.info(
-        "=============================================="
+        "===================================="
     )
 
     logger.info(
-        "👑 AUTOMATIC SCANNER STARTED"
+        "👑 AUTOMATIC SCANNER ONLINE"
     )
 
     logger.info(
@@ -1438,41 +1921,97 @@ async def scanner_loop(
     )
 
     logger.info(
-        "Markets: %s",
-        ", ".join(
-            MARKETS.keys()
-        ),
+        "Refresh interval: %s seconds",
+        AUTO_SCAN_SECONDS,
     )
 
     logger.info(
-        "=============================================="
+        "Request gap: %s seconds",
+        REQUEST_GAP_SECONDS,
     )
 
+    logger.info(
+        "===================================="
+    )
+
+    # Initial controlled refresh.
+
+    await refresh_all_markets()
+
     while True:
+
+        cycle_start = time.time()
 
         try:
 
             current_mode = MODE
 
-            await manual_scan(
+            # Analyse cached data.
+
+            await full_scan(
                 application,
                 current_mode,
+                refresh=False,
             )
+
+            # Only refresh if cooldown has expired.
+
+            if (
+                time.time()
+                >= RATE_LIMIT_UNTIL
+            ):
+
+                await refresh_all_markets()
+
+                # Re-analyse fresh cache.
+
+                await full_scan(
+                    application,
+                    current_mode,
+                    refresh=False,
+                )
+
+            else:
+
+                remaining = int(
+                    RATE_LIMIT_UNTIL -
+                    time.time()
+                )
+
+                logger.warning(
+                    "API cooldown: "
+                    "%ss remaining. "
+                    "Using cached data.",
+                    remaining,
+                )
 
         except Exception as error:
 
             logger.error(
-                "Scanner error: %s",
+                "Automatic scanner error: %s",
                 error,
             )
 
+        elapsed = (
+            time.time()
+            -
+            cycle_start
+        )
+
+        wait_time = max(
+            10,
+            AUTO_SCAN_SECONDS -
+            int(elapsed),
+        )
+
         logger.info(
-            "Waiting %s seconds...",
-            SCAN_SECONDS,
+            "Next automatic cycle "
+            "in %s seconds.",
+            wait_time,
         )
 
         await asyncio.sleep(
-            SCAN_SECONDS
+            wait_time
         )
 
 
@@ -1496,7 +2035,7 @@ async def post_init(
 
 
 # ============================================================
-# VALIDATION
+# CONFIG VALIDATION
 # ============================================================
 
 def validate_config():
@@ -1533,7 +2072,7 @@ def main():
     validate_config()
 
     logger.info(
-        "=============================================="
+        "===================================="
     )
 
     logger.info(
@@ -1541,7 +2080,11 @@ def main():
     )
 
     logger.info(
-        "Starting FULL Telegram bot..."
+        "RATE-LIMIT-SAFE VERSION"
+    )
+
+    logger.info(
+        "===================================="
     )
 
     logger.info(
@@ -1557,17 +2100,22 @@ def main():
     )
 
     logger.info(
-        "Normal confidence: %s%%",
-        NORMAL_CONFIDENCE,
+        "Auto scan: every %s seconds",
+        AUTO_SCAN_SECONDS,
     )
 
     logger.info(
-        "Scalp confidence: %s%%",
-        SCALP_CONFIDENCE,
+        "API request gap: %s seconds",
+        REQUEST_GAP_SECONDS,
     )
 
     logger.info(
-        "=============================================="
+        "429 cooldown: %s seconds",
+        RATE_LIMIT_COOLDOWN_SECONDS,
+    )
+
+    logger.info(
+        "===================================="
     )
 
     # Render web server.
@@ -1579,7 +2127,7 @@ def main():
 
     web_thread.start()
 
-    # Telegram.
+    # Telegram application.
 
     application = (
         Application
@@ -1593,7 +2141,9 @@ def main():
         .build()
     )
 
-    # Commands.
+    # ========================================================
+    # COMMANDS
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1644,7 +2194,7 @@ def main():
         )
     )
 
-    # Error handler.
+    # Telegram error handler.
 
     application.add_error_handler(
         error_handler
