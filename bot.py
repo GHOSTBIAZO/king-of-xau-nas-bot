@@ -17,112 +17,68 @@ from telegram.ext import (
 )
 
 # ============================================================
-# 👑 KING OF XAU_NAS — MULTI-MARKET TELEGRAM SCANNER
-# ============================================================
-#
-# Markets:
-#   XAU/USD
-#   US100
-#   US30
-#   GBP/USD
-#   GBP/JPY
-#   EUR/USD
-#
-# Data:
-#   Twelve Data
-#
-# Telegram:
-#   python-telegram-bot
-#
-# Deployment:
-#   Render / GitHub
-#
-# ============================================================
-
-
-# ============================================================
-# CONFIGURATION
+# 👑 KING OF XAU_NAS — MULTI MARKET TELEGRAM BOT
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS"
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-TWELVE_DATA_API_KEY = os.getenv(
-    "TWELVE_DATA_API_KEY",
-    ""
-).strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-PORT = int(
-    os.getenv("PORT", "10000")
-)
+INTERVAL = os.getenv("INTERVAL", "15min")
+OUTPUT_SIZE = int(os.getenv("OUTPUT_SIZE", "200"))
 
-INTERVAL = os.getenv(
-    "INTERVAL",
-    "15min"
-)
+# 70% gives the scanner more opportunities than the old 80%.
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 
-OUTPUT_SIZE = int(
-    os.getenv("OUTPUT_SIZE", "200")
-)
-
-SCAN_SECONDS = int(
-    os.getenv("SCAN_SECONDS", "60")
-)
-
-MIN_CONFIDENCE = int(
-    os.getenv("MIN_CONFIDENCE", "80")
-)
+# Scan every 60 seconds.
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
 
 CHAT_ID_FILE = "telegram_chat_id.json"
-
 
 # ============================================================
 # MARKETS
 # ============================================================
 
 SYMBOLS = {
-
     "XAU/USD": {
         "emoji": "🟡",
         "name": "Gold",
-        "digits": 2
+        "digits": 2,
     },
 
     "US100": {
         "emoji": "📈",
         "name": "Nasdaq 100",
-        "digits": 2
+        "digits": 2,
     },
 
     "US30": {
         "emoji": "🏛️",
         "name": "Dow Jones",
-        "digits": 2
+        "digits": 2,
     },
 
     "GBP/USD": {
         "emoji": "🇬🇧",
         "name": "GBP/USD",
-        "digits": 5
+        "digits": 5,
     },
 
     "GBP/JPY": {
         "emoji": "💷",
         "name": "GBP/JPY",
-        "digits": 3
+        "digits": 3,
     },
 
     "EUR/USD": {
         "emoji": "🇪🇺",
         "name": "EUR/USD",
-        "digits": 5
+        "digits": 5,
     },
 }
-
 
 # ============================================================
 # LOGGING
@@ -130,14 +86,13 @@ SYMBOLS = {
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger(BOT_NAME)
-
+logger = logging.getLogger("KING_OF_XAU_NAS")
 
 # ============================================================
-# FLASK SERVER
+# FLASK FOR RENDER
 # ============================================================
 
 app = Flask(__name__)
@@ -145,30 +100,27 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-
-    return "KING OF XAU_NAS is ONLINE."
+    return "KING OF XAU_NAS ONLINE"
 
 
 @app.route("/health")
 def health():
-
     return {
         "status": "online",
-        "bot": BOT_NAME,
-        "markets": len(SYMBOLS)
+        "markets": len(SYMBOLS),
+        "timeframe": INTERVAL,
     }
 
 
 def run_web_server():
-
     app.run(
         host="0.0.0.0",
-        port=PORT
+        port=PORT,
     )
 
 
 # ============================================================
-# TELEGRAM CHAT ID STORAGE
+# CHAT ID
 # ============================================================
 
 def load_chat_id():
@@ -180,7 +132,7 @@ def load_chat_id():
             with open(
                 CHAT_ID_FILE,
                 "r",
-                encoding="utf-8"
+                encoding="utf-8",
             ) as file:
 
                 data = json.load(file)
@@ -191,7 +143,7 @@ def load_chat_id():
 
         logger.warning(
             "Could not load chat ID: %s",
-            error
+            error,
         )
 
     return None
@@ -204,47 +156,43 @@ def save_chat_id(chat_id):
         with open(
             CHAT_ID_FILE,
             "w",
-            encoding="utf-8"
+            encoding="utf-8",
         ) as file:
 
             json.dump(
                 {
                     "chat_id": str(chat_id)
                 },
-                file
+                file,
             )
 
         logger.info(
-            "Telegram chat ID saved: %s",
-            chat_id
+            "Telegram Chat ID saved: %s",
+            chat_id,
         )
 
     except Exception as error:
 
         logger.error(
-            "Could not save chat ID: %s",
-            error
+            "Could not save Chat ID: %s",
+            error,
         )
 
 
 CHAT_ID = load_chat_id()
 
-
-# ============================================================
-# DUPLICATE SIGNAL PROTECTION
-# ============================================================
-
+# Prevent duplicate notifications.
 last_signals = {}
 
 
 # ============================================================
-# TELEGRAM SEND FUNCTION
+# TELEGRAM SEND
 # ============================================================
 
-async def send_text(
+async def send_message(
     application,
     text,
-    chat_id=None
+    chat_id=None,
 ):
 
     target = chat_id or CHAT_ID
@@ -252,18 +200,23 @@ async def send_text(
     if not target:
 
         logger.warning(
-            "No Telegram chat ID saved. "
-            "Send /start to the bot."
+            "No Chat ID saved. Send /start to the bot."
         )
 
         return False
 
     try:
 
+        # IMPORTANT:
+        # No parse_mode.
+        #
+        # This fixes:
+        # BadRequest:
+        # can't parse entities
+
         await application.bot.send_message(
             chat_id=target,
             text=text,
-            parse_mode="Markdown"
         )
 
         return True
@@ -272,7 +225,7 @@ async def send_text(
 
         logger.error(
             "Telegram send error: %s",
-            error
+            error,
         )
 
         return False
@@ -284,13 +237,15 @@ async def send_text(
 
 async def start_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     global CHAT_ID
 
     if not update.effective_chat:
+        return
 
+    if not update.message:
         return
 
     CHAT_ID = str(
@@ -300,16 +255,14 @@ async def start_command(
     save_chat_id(CHAT_ID)
 
     message = (
-        "👑 *KING OF XAU_NAS*\n"
+        "👑 KING OF XAU_NAS\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🟢 *BOT ONLINE*\n"
+        "🟢 BOT ONLINE\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "Your Telegram Chat ID has "
-        "been saved automatically.\n\n"
+        "Your Telegram Chat ID has been saved.\n\n"
 
-        "📊 *MARKETS MONITORED*\n\n"
-
+        "📊 MARKETS\n"
         "🟡 XAU/USD — Gold\n"
         "📈 US100 — Nasdaq 100\n"
         "🏛️ US30 — Dow Jones\n"
@@ -317,23 +270,20 @@ async def start_command(
         "💷 GBP/JPY\n"
         "🇪🇺 EUR/USD\n\n"
 
-        f"⏱ Timeframe: *{INTERVAL}*\n"
-        f"🎯 Minimum Confidence: "
-        f"*{MIN_CONFIDENCE}%*\n\n"
+        f"⏱ Timeframe: {INTERVAL}\n"
+        f"🎯 Minimum confidence: {MIN_CONFIDENCE}%\n"
+        "📡 Data: Twelve Data\n\n"
 
-        "📡 Data Source: *Twelve Data*\n\n"
+        "COMMANDS\n"
+        "/status\n"
+        "/watchlist\n"
+        "/start\n\n"
 
-        "Commands:\n"
-        "/status — Bot status\n"
-        "/watchlist — Markets\n"
-        "/start — Register chat\n\n"
-
-        "👑 *KING OF XAU_NAS IS READY.*"
+        "👑 KING OF XAU_NAS IS READY."
     )
 
     await update.message.reply_text(
-        message,
-        parse_mode="Markdown"
+        message
     )
 
 
@@ -343,23 +293,26 @@ async def start_command(
 
 async def status_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    if not update.message:
+        return
+
     message = (
-        "👑 *KING OF XAU_NAS — STATUS*\n"
+        "👑 KING OF XAU_NAS — STATUS\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "🟢 Scanner: *ONLINE*\n"
-        "🟢 Telegram: *CONNECTED*\n"
-        "🟢 Market Engine: *ACTIVE*\n\n"
+        "🟢 Telegram: CONNECTED\n"
+        "🟢 Scanner: RUNNING\n"
+        "🟢 Market Engine: ACTIVE\n\n"
 
-        f"📊 Markets: *{len(SYMBOLS)}*\n"
-        f"⏱ Timeframe: *{INTERVAL}*\n"
-        f"🎯 Confidence: *{MIN_CONFIDENCE}%+\n"
-        f"📡 Data: *Twelve Data*\n\n"
+        f"📊 Markets: {len(SYMBOLS)}\n"
+        f"⏱ Timeframe: {INTERVAL}\n"
+        f"🎯 Minimum confidence: {MIN_CONFIDENCE}%\n"
+        "📡 Data: Twelve Data\n\n"
 
-        "Markets:\n"
+        "MONITORING:\n"
         "🟡 XAU/USD\n"
         "📈 US100\n"
         "🏛️ US30\n"
@@ -369,8 +322,7 @@ async def status_command(
     )
 
     await update.message.reply_text(
-        message,
-        parse_mode="Markdown"
+        message
     )
 
 
@@ -380,39 +332,55 @@ async def status_command(
 
 async def watchlist_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    if not update.message:
+        return
+
     lines = [
-        "👑 *KING OF XAU_NAS — WATCHLIST*",
+        "👑 KING OF XAU_NAS — WATCHLIST",
         "━━━━━━━━━━━━━━━━━━━━",
-        ""
     ]
 
     for symbol, info in SYMBOLS.items():
 
         lines.append(
-            f"{info['emoji']} *{symbol}*"
-            f" — {info['name']}"
+            f"{info['emoji']} "
+            f"{symbol} — "
+            f"{info['name']}"
         )
 
     lines.extend(
         [
-            "",
-            f"⏱ Timeframe: *{INTERVAL}*",
-            f"🎯 Minimum Confidence: "
-            f"*{MIN_CONFIDENCE}%*"
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"⏱ Timeframe: {INTERVAL}",
+            f"🎯 Minimum confidence: {MIN_CONFIDENCE}%",
         ]
     )
 
     await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown"
+        "\n".join(lines)
     )
 
 
 # ============================================================
-# TWELVE DATA — MARKET DATA
+# TELEGRAM ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update,
+    context,
+):
+
+    logger.error(
+        "Telegram error: %s",
+        context.error,
+    )
+
+
+# ============================================================
+# TWELVE DATA
 # ============================================================
 
 def fetch_market_data(symbol):
@@ -420,7 +388,7 @@ def fetch_market_data(symbol):
     if not TWELVE_DATA_API_KEY:
 
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY is not configured."
+            "TWELVE_DATA_API_KEY is missing."
         )
 
     url = (
@@ -428,21 +396,17 @@ def fetch_market_data(symbol):
         "time_series"
     )
 
-    parameters = {
-
+    params = {
         "symbol": symbol,
-
         "interval": INTERVAL,
-
         "outputsize": OUTPUT_SIZE,
-
-        "apikey": TWELVE_DATA_API_KEY
+        "apikey": TWELVE_DATA_API_KEY,
     }
 
     response = requests.get(
         url,
-        params=parameters,
-        timeout=20
+        params=params,
+        timeout=20,
     )
 
     response.raise_for_status()
@@ -454,7 +418,7 @@ def fetch_market_data(symbol):
         raise RuntimeError(
             data.get(
                 "message",
-                f"No data returned for {symbol}"
+                f"No data for {symbol}",
             )
         )
 
@@ -462,36 +426,37 @@ def fetch_market_data(symbol):
         data["values"]
     )
 
-    required_columns = [
+    required = [
         "datetime",
         "open",
         "high",
         "low",
-        "close"
+        "close",
     ]
 
     missing = [
         column
-        for column in required_columns
+        for column in required
         if column not in df.columns
     ]
 
     if missing:
 
         raise RuntimeError(
-            f"{symbol}: missing {missing}"
+            f"{symbol}: missing columns "
+            f"{missing}"
         )
 
     for column in [
         "open",
         "high",
         "low",
-        "close"
+        "close",
     ]:
 
         df[column] = pd.to_numeric(
             df[column],
-            errors="coerce"
+            errors="coerce",
         )
 
     df = df.dropna(
@@ -499,12 +464,12 @@ def fetch_market_data(symbol):
             "open",
             "high",
             "low",
-            "close"
+            "close",
         ]
     )
 
-    # Twelve Data normally returns newest first.
-    # Reverse so calculations run chronologically.
+    # Twelve Data normally returns
+    # newest candle first.
 
     df = (
         df
@@ -515,8 +480,8 @@ def fetch_market_data(symbol):
     if len(df) < 60:
 
         raise RuntimeError(
-            f"{symbol}: insufficient candles "
-            f"({len(df)})"
+            f"{symbol}: only "
+            f"{len(df)} candles available."
         )
 
     return df
@@ -536,7 +501,7 @@ def add_indicators(df):
         df["close"]
         .ewm(
             span=20,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
@@ -547,7 +512,7 @@ def add_indicators(df):
         df["close"]
         .ewm(
             span=50,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
@@ -556,28 +521,28 @@ def add_indicators(df):
 
     delta = df["close"].diff()
 
-    gains = delta.clip(
+    gain = delta.clip(
         lower=0
     )
 
-    losses = -delta.clip(
+    loss = -delta.clip(
         upper=0
     )
 
     avg_gain = (
-        gains
+        gain
         .ewm(
             alpha=1 / 14,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
 
     avg_loss = (
-        losses
+        loss
         .ewm(
             alpha=1 / 14,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
@@ -586,7 +551,7 @@ def add_indicators(df):
         avg_gain /
         avg_loss.replace(
             0,
-            float("nan")
+            float("nan"),
         )
     )
 
@@ -606,7 +571,8 @@ def add_indicators(df):
     # ATR 14
 
     previous_close = (
-        df["close"].shift(1)
+        df["close"]
+        .shift(1)
     )
 
     tr1 = (
@@ -628,16 +594,16 @@ def add_indicators(df):
         [
             tr1,
             tr2,
-            tr3
+            tr3,
         ],
-        axis=1
+        axis=1,
     ).max(axis=1)
 
     df["atr"] = (
         true_range
         .ewm(
             alpha=1 / 14,
-            adjust=False
+            adjust=False,
         )
         .mean()
     )
@@ -646,13 +612,12 @@ def add_indicators(df):
 
 
 # ============================================================
-# BREAK OF STRUCTURE
+# BOS
 # ============================================================
 
 def detect_bos(df):
 
     if len(df) < 10:
-
         return None
 
     last = df.iloc[-1]
@@ -670,40 +635,31 @@ def detect_bos(df):
     )
 
     if last["close"] > previous_high:
-
         return "BUY"
 
     if last["close"] < previous_low:
-
         return "SELL"
 
     return None
 
 
 # ============================================================
-# CHANGE OF CHARACTER
+# CHOCH
 # ============================================================
 
 def detect_choch(df):
 
     if len(df) < 10:
-
         return None
 
     recent = df.iloc[-8:-1]
 
     last = df.iloc[-1]
 
-    swing_high = recent["high"].max()
-
-    swing_low = recent["low"].min()
-
-    if last["close"] > swing_high:
-
+    if last["close"] > recent["high"].max():
         return "BUY"
 
-    if last["close"] < swing_low:
-
+    if last["close"] < recent["low"].min():
         return "SELL"
 
     return None
@@ -716,7 +672,6 @@ def detect_choch(df):
 def detect_liquidity_sweep(df):
 
     if len(df) < 20:
-
         return None
 
     last = df.iloc[-1]
@@ -731,69 +686,48 @@ def detect_liquidity_sweep(df):
         previous["low"].min()
     )
 
-    # Buy-side liquidity swept
-    # and price closes back below.
-
     if (
         last["high"] > previous_high
         and
         last["close"] < previous_high
     ):
-
         return "SELL"
-
-    # Sell-side liquidity swept
-    # and price closes back above.
 
     if (
         last["low"] < previous_low
         and
         last["close"] > previous_low
     ):
-
         return "BUY"
 
     return None
 
 
 # ============================================================
-# FAIR VALUE GAP
+# FVG
 # ============================================================
 
 def detect_fvg(df):
 
     if len(df) < 5:
-
         return None
 
-    candle1 = df.iloc[-3]
-
-    candle2 = df.iloc[-2]
-
-    candle3 = df.iloc[-1]
-
-    # Bullish FVG
+    c1 = df.iloc[-3]
+    c2 = df.iloc[-2]
+    c3 = df.iloc[-1]
 
     if (
-        candle3["low"] >
-        candle1["high"]
+        c3["low"] > c1["high"]
         and
-        candle2["close"] >
-        candle2["open"]
+        c2["close"] > c2["open"]
     ):
-
         return "BUY"
 
-    # Bearish FVG
-
     if (
-        candle3["high"] <
-        candle1["low"]
+        c3["high"] < c1["low"]
         and
-        candle2["close"] <
-        candle2["open"]
+        c2["close"] < c2["open"]
     ):
-
         return "SELL"
 
     return None
@@ -809,228 +743,141 @@ def detect_momentum(df):
 
     previous = df.iloc[-2]
 
-    if (
-        last["close"] >
-        previous["close"]
-    ):
-
+    if last["close"] > previous["close"]:
         return "BUY"
 
-    if (
-        last["close"] <
-        previous["close"]
-    ):
-
+    if last["close"] < previous["close"]:
         return "SELL"
 
     return None
 
 
 # ============================================================
-# CONFIDENCE ENGINE
+# CONFIDENCE
 # ============================================================
 
 def calculate_signal(df):
 
     last = df.iloc[-1]
 
-    price = float(
-        last["close"]
-    )
-
-    ema20 = float(
-        last["ema20"]
-    )
-
-    ema50 = float(
-        last["ema50"]
-    )
-
-    rsi = float(
-        last["rsi"]
-    )
-
-    atr = float(
-        last["atr"]
-    )
+    price = float(last["close"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
+    rsi = float(last["rsi"])
+    atr = float(last["atr"])
 
     if atr <= 0:
-
-        return None
+        return None, 0, "Invalid ATR"
 
     bos = detect_bos(df)
-
     choch = detect_choch(df)
-
-    liquidity = (
-        detect_liquidity_sweep(df)
-    )
-
+    liquidity = detect_liquidity_sweep(df)
     fvg = detect_fvg(df)
-
     momentum = detect_momentum(df)
 
     buy_score = 0
-
     sell_score = 0
 
-    # ========================================================
-    # TREND — 20 POINTS
-    # ========================================================
+    # TREND — 20
 
     if ema20 > ema50:
-
         buy_score += 20
 
     elif ema20 < ema50:
-
         sell_score += 20
 
-    # ========================================================
-    # RSI — 15 POINTS
-    # ========================================================
+    # RSI — 15
+    #
+    # Broadened from the old strict
+    # 55/45 zones.
 
-    if 55 <= rsi <= 72:
-
+    if 52 <= rsi <= 72:
         buy_score += 15
 
-    elif 28 <= rsi <= 45:
-
+    elif 28 <= rsi <= 48:
         sell_score += 15
 
-    # ========================================================
-    # BOS — 15 POINTS
-    # ========================================================
+    # BOS — 15
 
     if bos == "BUY":
-
         buy_score += 15
 
     elif bos == "SELL":
-
         sell_score += 15
 
-    # ========================================================
-    # CHOCH — 15 POINTS
-    # ========================================================
+    # CHOCH — 15
 
     if choch == "BUY":
-
         buy_score += 15
 
     elif choch == "SELL":
-
         sell_score += 15
 
-    # ========================================================
-    # FVG — 15 POINTS
-    # ========================================================
+    # FVG — 15
 
     if fvg == "BUY":
-
         buy_score += 15
 
     elif fvg == "SELL":
-
         sell_score += 15
 
-    # ========================================================
-    # LIQUIDITY — 10 POINTS
-    # ========================================================
+    # LIQUIDITY — 10
 
     if liquidity == "BUY":
-
         buy_score += 10
 
     elif liquidity == "SELL":
-
         sell_score += 10
 
-    # ========================================================
-    # MOMENTUM — 10 POINTS
-    # ========================================================
+    # MOMENTUM — 10
 
     if momentum == "BUY":
-
         buy_score += 10
 
     elif momentum == "SELL":
-
         sell_score += 10
 
-    # ========================================================
-    # SELECT SIDE
-    # ========================================================
+    # Select strongest side.
 
     if buy_score >= sell_score:
 
         side = "BUY"
-
         confidence = buy_score
 
     else:
 
         side = "SELL"
-
         confidence = sell_score
 
-    # ========================================================
-    # FILTER
-    # ========================================================
+    # Log candidate even if it does not
+    # qualify.
 
     if confidence < MIN_CONFIDENCE:
 
-        return None
+        return (
+            None,
+            confidence,
+            f"{side} candidate {confidence}%"
+            f" — below {MIN_CONFIDENCE}%",
+        )
 
-    # ========================================================
-    # ATR RISK MANAGEMENT
-    # ========================================================
+    # ATR-based levels.
 
     if side == "BUY":
 
-        sl = (
-            price -
-            (atr * 1.5)
-        )
-
-        tp1 = (
-            price +
-            (atr * 2.0)
-        )
-
-        tp2 = (
-            price +
-            (atr * 3.0)
-        )
-
-        tp3 = (
-            price +
-            (atr * 5.0)
-        )
+        sl = price - atr * 1.5
+        tp1 = price + atr * 2.0
+        tp2 = price + atr * 3.0
+        tp3 = price + atr * 5.0
 
     else:
 
-        sl = (
-            price +
-            (atr * 1.5)
-        )
+        sl = price + atr * 1.5
+        tp1 = price - atr * 2.0
+        tp2 = price - atr * 3.0
+        tp3 = price - atr * 5.0
 
-        tp1 = (
-            price -
-            (atr * 2.0)
-        )
-
-        tp2 = (
-            price -
-            (atr * 3.0)
-        )
-
-        tp3 = (
-            price -
-            (atr * 5.0)
-        )
-
-    return {
+    signal = {
 
         "side": side,
 
@@ -1062,8 +909,14 @@ def calculate_signal(df):
 
         "liquidity": liquidity,
 
-        "momentum": momentum
+        "momentum": momentum,
     }
+
+    return (
+        signal,
+        confidence,
+        f"{side} QUALIFYING SIGNAL",
+    )
 
 
 # ============================================================
@@ -1072,20 +925,12 @@ def calculate_signal(df):
 
 def format_price(
     symbol,
-    value
+    value,
 ):
 
-    digits = (
-        SYMBOLS
-        .get(
-            symbol,
-            {}
-        )
-        .get(
-            "digits",
-            2
-        )
-    )
+    digits = SYMBOLS[
+        symbol
+    ]["digits"]
 
     return (
         f"{value:,.{digits}f}"
@@ -1093,45 +938,23 @@ def format_price(
 
 
 # ============================================================
-# CONFIRMATION MARK
-# ============================================================
-
-def mark(
-    value,
-    side
-):
-
-    if value == side:
-
-        return "✅"
-
-    return "—"
-
-
-# ============================================================
-# TELEGRAM SIGNAL MESSAGE
+# SIGNAL MESSAGE
 # ============================================================
 
 def build_signal_message(
     symbol,
-    signal
+    signal,
 ):
 
     info = SYMBOLS[symbol]
 
     side = signal["side"]
 
-    confidence = (
-        signal["confidence"]
+    direction = (
+        "🟢"
+        if side == "BUY"
+        else "🔴"
     )
-
-    if side == "BUY":
-
-        direction = "🟢"
-
-    else:
-
-        direction = "🔴"
 
     timestamp = (
         datetime
@@ -1141,106 +964,102 @@ def build_signal_message(
         )
     )
 
-    message = (
+    def mark(value):
+        return (
+            "✅"
+            if value == side
+            else "—"
+        )
 
+    return (
         f"{BOT_NAME}\n"
-
         f"{info['emoji']} "
-        f"*{symbol} — "
-        f"{info['name']}*\n"
-
+        f"{symbol} — "
+        f"{info['name']}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"{direction} "
-        f"*SIGNAL CONFIRMED — "
-        f"{side}*\n"
+        f"SIGNAL CONFIRMED — "
+        f"{side}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
-        "📌 Setup: *INSTITUTIONAL*\n"
-
-        "🎯 Stage: *CONFIRMED*\n"
+        "📌 Setup: INSTITUTIONAL\n"
+        "🎯 Stage: CONFIRMED\n"
 
         f"💯 Confidence: "
-        f"*{confidence}%*\n"
+        f"{signal['confidence']}%\n"
 
         f"💰 Entry: "
-        f"*{format_price(symbol, signal['price'])}*\n"
+        f"{format_price(symbol, signal['price'])}\n"
 
         f"🛑 Stop Loss: "
-        f"*{format_price(symbol, signal['sl'])}*\n"
+        f"{format_price(symbol, signal['sl'])}\n"
 
         f"🎯 TP1: "
-        f"*{format_price(symbol, signal['tp1'])}*\n"
+        f"{format_price(symbol, signal['tp1'])}\n"
 
         f"🎯 TP2: "
-        f"*{format_price(symbol, signal['tp2'])}*\n"
+        f"{format_price(symbol, signal['tp2'])}\n"
 
         f"🎯 TP3: "
-        f"*{format_price(symbol, signal['tp3'])}*\n"
+        f"{format_price(symbol, signal['tp3'])}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"📊 EMA20: "
-        f"*{format_price(symbol, signal['ema20'])}*\n"
+        f"{format_price(symbol, signal['ema20'])}\n"
 
         f"📊 EMA50: "
-        f"*{format_price(symbol, signal['ema50'])}*\n"
+        f"{format_price(symbol, signal['ema50'])}\n"
 
         f"📈 RSI14: "
-        f"*{signal['rsi']:.1f}*\n"
+        f"{signal['rsi']:.1f}\n"
 
         f"⚡ ATR14: "
-        f"*{format_price(symbol, signal['atr'])}*\n"
+        f"{format_price(symbol, signal['atr'])}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"🏗 BOS: "
-        f"{mark(signal['bos'], side)}\n"
+        f"{mark(signal['bos'])}\n"
 
         f"🔄 CHoCH: "
-        f"{mark(signal['choch'], side)}\n"
+        f"{mark(signal['choch'])}\n"
 
         f"💧 Liquidity Sweep: "
-        f"{mark(signal['liquidity'], side)}\n"
+        f"{mark(signal['liquidity'])}\n"
 
         f"📦 FVG: "
-        f"{mark(signal['fvg'], side)}\n"
+        f"{mark(signal['fvg'])}\n"
 
         f"⚡ Momentum: "
-        f"{mark(signal['momentum'], side)}\n"
+        f"{mark(signal['momentum'])}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"⏱ Timeframe: "
-        f"*{INTERVAL}*\n"
+        f"{INTERVAL}\n"
 
         f"🕐 {timestamp}\n\n"
 
-        "⚠️ *Analysis only — "
-        "not financial advice.*"
+        "⚠️ Analysis only — "
+        "not financial advice."
     )
-
-    return message
 
 
 # ============================================================
-# ANALYZE MARKET
+# SCAN ONE MARKET
 # ============================================================
 
 async def analyze_and_send(
     application,
-    symbol
+    symbol,
 ):
 
     global last_signals
 
     try:
-
-        logger.info(
-            "Scanning %s...",
-            symbol
-        )
 
         df = fetch_market_data(
             symbol
@@ -1250,22 +1069,37 @@ async def analyze_and_send(
             df
         )
 
-        signal = calculate_signal(
-            df
+        signal, confidence, reason = (
+            calculate_signal(df)
+        )
+
+        last = df.iloc[-1]
+
+        logger.info(
+            "%s → %s | "
+            "Price=%s | "
+            "RSI=%.1f | "
+            "EMA20=%s | "
+            "EMA50=%s",
+            symbol,
+            reason,
+            format_price(
+                symbol,
+                float(last["close"]),
+            ),
+            float(last["rsi"]),
+            format_price(
+                symbol,
+                float(last["ema20"]),
+            ),
+            format_price(
+                symbol,
+                float(last["ema50"]),
+            ),
         )
 
         if not signal:
-
-            logger.info(
-                "%s: no qualifying signal.",
-                symbol
-            )
-
             return
-
-        # Use the candle timestamp,
-        # side and confidence as the
-        # duplicate-protection key.
 
         candle_time = str(
             df.iloc[-1]["datetime"]
@@ -1274,8 +1108,7 @@ async def analyze_and_send(
         signal_key = (
             f"{symbol}:"
             f"{candle_time}:"
-            f"{signal['side']}:"
-            f"{signal['confidence']}"
+            f"{signal['side']}"
         )
 
         if (
@@ -1285,8 +1118,8 @@ async def analyze_and_send(
         ):
 
             logger.info(
-                "%s: duplicate skipped.",
-                symbol
+                "%s → duplicate skipped",
+                symbol,
             )
 
             return
@@ -1298,83 +1131,104 @@ async def analyze_and_send(
         message = (
             build_signal_message(
                 symbol,
-                signal
+                signal,
             )
         )
 
-        sent = await send_text(
+        sent = await send_message(
             application,
-            message
+            message,
         )
 
         if sent:
 
             logger.info(
-                "%s: %s signal sent — %s%%",
+                "%s → %s SIGNAL SENT "
+                "at %s%%",
                 symbol,
                 signal["side"],
-                signal["confidence"]
+                signal["confidence"],
             )
 
     except Exception as error:
 
         logger.warning(
-            "%s scan failed: %s",
+            "%s → scan failed: %s",
             symbol,
-            error
+            error,
         )
 
 
 # ============================================================
-# SCANNER LOOP
+# SCANNER
 # ============================================================
 
 async def scanner_loop(
-    application
+    application,
 ):
 
     logger.info(
-        "Multi-market scanner started."
+        "=============================================="
+    )
+
+    logger.info(
+        "👑 KING OF XAU_NAS SCANNER STARTED"
     )
 
     logger.info(
         "Markets: %s",
         ", ".join(
             SYMBOLS.keys()
-        )
+        ),
+    )
+
+    logger.info(
+        "Timeframe: %s",
+        INTERVAL,
+    )
+
+    logger.info(
+        "Minimum confidence: %s%%",
+        MIN_CONFIDENCE,
+    )
+
+    logger.info(
+        "=============================================="
     )
 
     while True:
 
-        scan_started = time.time()
+        scan_started = (
+            time.time()
+        )
 
         for symbol in SYMBOLS:
 
             await analyze_and_send(
                 application,
-                symbol
+                symbol,
             )
 
-            # Small delay between
-            # Twelve Data requests.
+            # Protect API rate limits.
 
             await asyncio.sleep(2)
 
         elapsed = (
-            time.time() -
+            time.time()
+            -
             scan_started
         )
 
         wait_time = max(
             5,
             SCAN_SECONDS -
-            int(elapsed)
+            int(elapsed),
         )
 
         logger.info(
-            "Full scan completed. "
+            "Full scan complete. "
             "Next scan in %s seconds.",
-            wait_time
+            wait_time,
         )
 
         await asyncio.sleep(
@@ -1383,11 +1237,11 @@ async def scanner_loop(
 
 
 # ============================================================
-# POST INITIALIZATION
+# POST INIT
 # ============================================================
 
 async def post_init(
-    application
+    application,
 ):
 
     asyncio.create_task(
@@ -1397,12 +1251,12 @@ async def post_init(
     )
 
     logger.info(
-        "Background scanner created."
+        "Background scanner started."
     )
 
 
 # ============================================================
-# CONFIGURATION VALIDATION
+# VALIDATE
 # ============================================================
 
 def validate_config():
@@ -1440,50 +1294,49 @@ def main():
     validate_config()
 
     logger.info(
-        "=" * 60
+        "=============================================="
     )
 
     logger.info(
         "%s",
-        BOT_NAME
+        BOT_NAME,
     )
 
     logger.info(
-        "Starting multi-market scanner..."
+        "Starting Telegram bot..."
     )
 
     logger.info(
         "Markets: %s",
         ", ".join(
             SYMBOLS.keys()
-        )
+        ),
     )
 
     logger.info(
         "Timeframe: %s",
-        INTERVAL
+        INTERVAL,
     )
 
     logger.info(
         "Minimum confidence: %s%%",
-        MIN_CONFIDENCE
+        MIN_CONFIDENCE,
     )
 
     logger.info(
-        "=" * 60
+        "=============================================="
     )
 
-    # Start Flask server
-    # for Render.
+    # Render web server.
 
     web_thread = Thread(
         target=run_web_server,
-        daemon=True
+        daemon=True,
     )
 
     web_thread.start()
 
-    # Build Telegram application.
+    # Telegram application.
 
     application = (
         Application
@@ -1497,41 +1350,47 @@ def main():
         .build()
     )
 
-    # Telegram commands.
-
     application.add_handler(
         CommandHandler(
             "start",
-            start_command
+            start_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "status",
-            status_command
+            status_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "watchlist",
-            watchlist_command
+            watchlist_command,
         )
     )
 
+    # FIX:
+    # Prevents:
+    # "No error handlers are registered"
+
+    application.add_error_handler(
+        error_handler
+    )
+
     logger.info(
-        "Telegram polling started."
+        "Telegram polling starting..."
     )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
 
 
 # ============================================================
-# START
+# START BOT
 # ============================================================
 
 if __name__ == "__main__":
