@@ -1,6 +1,6 @@
 import os
-import json
 import time
+import json
 import asyncio
 import logging
 from threading import Thread, Lock
@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import requests
 import pandas as pd
 from flask import Flask
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -17,56 +18,38 @@ from telegram.ext import (
 )
 
 # ============================================================
-# 👑 KING OF XAU_NAS
-# 4-MARKET RATE-LIMIT-SAFE TELEGRAM SCANNER
+# 👑 KING OF XAU_NAS — 4 MARKET VERSION
+# XAU/USD | GBP/USD | GBP/JPY | EUR/USD
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS"
 
 TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
+    "TELEGRAM_BOT_TOKEN", ""
 ).strip()
 
 TWELVE_DATA_API_KEY = os.getenv(
-    "TWELVE_DATA_API_KEY",
-    ""
+    "TWELVE_DATA_API_KEY", ""
 ).strip()
 
-PORT = int(
-    os.getenv("PORT", "10000")
-)
+PORT = int(os.getenv("PORT", "10000"))
 
 TIMEFRAME = os.getenv(
-    "INTERVAL",
-    "15min"
+    "INTERVAL", "15min"
 )
 
 OUTPUT_SIZE = int(
-    os.getenv("OUTPUT_SIZE", "80")
+    os.getenv("OUTPUT_SIZE", "100")
 )
 
-# ============================================================
-# RATE LIMIT PROTECTION
-# ============================================================
-
-# Full refresh every 5 minutes.
 AUTO_SCAN_SECONDS = int(
-    os.getenv(
-        "AUTO_SCAN_SECONDS",
-        "300"
-    )
+    os.getenv("AUTO_SCAN_SECONDS", "300")
 )
 
-# Minimum gap between API requests.
 REQUEST_GAP_SECONDS = float(
-    os.getenv(
-        "REQUEST_GAP_SECONDS",
-        "8"
-    )
+    os.getenv("REQUEST_GAP_SECONDS", "8")
 )
 
-# Pause after HTTP 429.
 RATE_LIMIT_COOLDOWN_SECONDS = int(
     os.getenv(
         "RATE_LIMIT_COOLDOWN_SECONDS",
@@ -74,35 +57,17 @@ RATE_LIMIT_COOLDOWN_SECONDS = int(
     )
 )
 
-# Cache is considered fresh for this period.
 CACHE_SECONDS = int(
-    os.getenv(
-        "CACHE_SECONDS",
-        "300"
-    )
+    os.getenv("CACHE_SECONDS", "300")
 )
 
-# ============================================================
-# SIGNAL SETTINGS
-# ============================================================
-
 NORMAL_CONFIDENCE = int(
-    os.getenv(
-        "NORMAL_CONFIDENCE",
-        "70"
-    )
+    os.getenv("NORMAL_CONFIDENCE", "65")
 )
 
 SCALP_CONFIDENCE = int(
-    os.getenv(
-        "SCALP_CONFIDENCE",
-        "60"
-    )
+    os.getenv("SCALP_CONFIDENCE", "55")
 )
-
-# ============================================================
-# FILES
-# ============================================================
 
 CHAT_ID_FILE = "telegram_chat_id.json"
 
@@ -113,22 +78,19 @@ CHAT_ID_FILE = "telegram_chat_id.json"
 MARKETS = {
     "XAU/USD": {
         "emoji": "🟡",
-        "name": "Gold",
+        "name": "GOLD",
         "digits": 2,
     },
-
     "GBP/USD": {
         "emoji": "🇬🇧",
         "name": "GBP/USD",
         "digits": 5,
     },
-
     "GBP/JPY": {
         "emoji": "💷",
         "name": "GBP/JPY",
         "digits": 3,
     },
-
     "EUR/USD": {
         "emoji": "🇪🇺",
         "name": "EUR/USD",
@@ -144,7 +106,11 @@ MODE = "NORMAL"
 
 CHAT_ID = None
 
-SCANNER_RUNNING = False
+DATA_CACHE = {}
+
+LATEST_RESULTS = {}
+
+LAST_SIGNAL_KEYS = {}
 
 LAST_API_REQUEST = 0.0
 
@@ -152,11 +118,7 @@ RATE_LIMIT_UNTIL = 0.0
 
 API_LOCK = Lock()
 
-DATA_CACHE = {}
-
-LATEST_RESULTS = {}
-
-LAST_SIGNALS = {}
+SCANNER_RUNNING = False
 
 # ============================================================
 # LOGGING
@@ -164,11 +126,7 @@ LAST_SIGNALS = {}
 
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s - "
-        "%(levelname)s - "
-        "%(message)s"
-    ),
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 logger = logging.getLogger(
@@ -176,7 +134,7 @@ logger = logging.getLogger(
 )
 
 # ============================================================
-# FLASK / RENDER HEALTH SERVER
+# FLASK
 # ============================================================
 
 app = Flask(__name__)
@@ -184,7 +142,6 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-
     return "KING OF XAU_NAS ONLINE"
 
 
@@ -193,24 +150,16 @@ def health():
 
     cooldown = max(
         0,
-        int(
-            RATE_LIMIT_UNTIL -
-            time.time()
-        ),
+        int(RATE_LIMIT_UNTIL - time.time())
     )
 
     return {
         "status": "online",
-        "bot": BOT_NAME,
         "mode": MODE,
         "scanner": SCANNER_RUNNING,
-        "markets": list(
-            MARKETS.keys()
-        ),
-        "cached_markets": len(
-            DATA_CACHE
-        ),
-        "cooldown_seconds": cooldown,
+        "markets": list(MARKETS.keys()),
+        "cached_markets": len(DATA_CACHE),
+        "api_cooldown": cooldown,
     }
 
 
@@ -230,29 +179,23 @@ def load_chat_id():
 
     try:
 
-        if os.path.exists(
-            CHAT_ID_FILE
-        ):
+        if os.path.exists(CHAT_ID_FILE):
 
             with open(
                 CHAT_ID_FILE,
                 "r",
                 encoding="utf-8",
-            ) as file:
+            ) as f:
 
-                data = json.load(
-                    file
-                )
+                data = json.load(f)
 
-                return data.get(
-                    "chat_id"
-                )
+                return data.get("chat_id")
 
-    except Exception as error:
+    except Exception as e:
 
         logger.warning(
-            "Chat ID load error: %s",
-            error,
+            "Could not load chat ID: %s",
+            e
         )
 
     return None
@@ -266,61 +209,47 @@ def save_chat_id(chat_id):
             CHAT_ID_FILE,
             "w",
             encoding="utf-8",
-        ) as file:
+        ) as f:
 
             json.dump(
-                {
-                    "chat_id": str(
-                        chat_id
-                    )
-                },
-                file,
+                {"chat_id": str(chat_id)},
+                f
             )
 
-        logger.info(
-            "Telegram Chat ID saved."
-        )
-
-    except Exception as error:
+    except Exception as e:
 
         logger.error(
-            "Chat ID save error: %s",
-            error,
+            "Could not save chat ID: %s",
+            e
         )
 
 
 CHAT_ID = load_chat_id()
 
 # ============================================================
-# TELEGRAM SEND
+# TELEGRAM MESSAGE
 # ============================================================
 
-async def send_telegram(
+async def send_message(
     application,
     message,
     chat_id=None,
 ):
 
-    target = (
-        chat_id
-        or CHAT_ID
-    )
+    target = chat_id or CHAT_ID
 
     if not target:
 
         logger.warning(
-            "No TELEGRAM_CHAT_ID. "
-            "Send /start first."
+            "No Telegram chat ID."
         )
 
         return False
 
     try:
 
-        # Plain text intentionally.
-        # This prevents Telegram:
-        # "can't parse entities"
-        # errors.
+        # Plain text deliberately.
+        # Prevents Telegram entity parsing errors.
 
         await application.bot.send_message(
             chat_id=target,
@@ -329,18 +258,18 @@ async def send_telegram(
 
         return True
 
-    except Exception as error:
+    except Exception as e:
 
         logger.error(
             "Telegram send error: %s",
-            error,
+            e
         )
 
         return False
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 async def start_command(
@@ -353,16 +282,13 @@ async def start_command(
     if not update.message:
         return
 
-    if not update.effective_chat:
-        return
+    if update.effective_chat:
 
-    CHAT_ID = str(
-        update.effective_chat.id
-    )
+        CHAT_ID = str(
+            update.effective_chat.id
+        )
 
-    save_chat_id(
-        CHAT_ID
-    )
+        save_chat_id(CHAT_ID)
 
     message = (
         "👑 KING OF XAU_NAS\n"
@@ -371,13 +297,13 @@ async def start_command(
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
         "📊 ACTIVE MARKETS\n"
-        "🟡 XAU/USD — Gold\n"
+        "🟡 XAU/USD — GOLD\n"
         "🇬🇧 GBP/USD\n"
         "💷 GBP/JPY\n"
         "🇪🇺 EUR/USD\n\n"
 
-        f"⚙️ Mode: {MODE}\n"
-        f"⏱ Timeframe: {TIMEFRAME}\n\n"
+        f"⚙️ MODE: {MODE}\n"
+        f"⏱ TIMEFRAME: {TIMEFRAME}\n\n"
 
         "COMMANDS\n"
         "/status\n"
@@ -387,8 +313,7 @@ async def start_command(
         "/normal\n"
         "/signals\n\n"
 
-        "🛡 Rate-limit protection ACTIVE\n"
-        "👑 KING OF XAU_NAS READY."
+        "🛡 Rate-limit protection ACTIVE"
     )
 
     await update.message.reply_text(
@@ -397,7 +322,7 @@ async def start_command(
 
 
 # ============================================================
-# /STATUS
+# STATUS
 # ============================================================
 
 async def status_command(
@@ -410,78 +335,56 @@ async def status_command(
 
     cooldown = max(
         0,
-        int(
-            RATE_LIMIT_UNTIL -
-            time.time()
-        ),
+        int(RATE_LIMIT_UNTIL - time.time())
     )
 
-    cache_lines = []
+    lines = [
+        "👑 KING OF XAU_NAS — STATUS",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "🟢 BOT: ONLINE",
+        "🟢 SCANNER: ACTIVE",
+        "🟢 SIGNAL ENGINE: ACTIVE",
+        f"⚙️ MODE: {MODE}",
+        f"⏱ TIMEFRAME: {TIMEFRAME}",
+        "",
+        "CACHE:",
+    ]
 
     for symbol in MARKETS:
 
-        cached = DATA_CACHE.get(
-            symbol
-        )
+        cache = DATA_CACHE.get(symbol)
 
-        if cached:
+        if cache:
 
             age = int(
-                time.time()
-                -
-                cached["timestamp"]
+                time.time() -
+                cache["timestamp"]
             )
 
-            cache_lines.append(
-                f"💾 {symbol}: "
-                f"{age}s old"
+            lines.append(
+                f"💾 {symbol}: {age}s old"
             )
 
         else:
 
-            cache_lines.append(
-                f"⏳ {symbol}: "
-                "no data"
+            lines.append(
+                f"⏳ {symbol}: NO DATA"
             )
 
-    message = (
-        "👑 KING OF XAU_NAS — STATUS\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "🟢 Bot: ONLINE\n"
-        "🟢 Telegram: CONNECTED\n"
-        "🟢 Scanner: RUNNING\n"
-        "🟢 Signal engine: ACTIVE\n\n"
-
-        f"⚙️ Mode: {MODE}\n"
-        f"⏱ Timeframe: {TIMEFRAME}\n"
-        f"📊 Markets: {len(MARKETS)}\n\n"
-
-        "CACHE\n"
-        + "\n".join(
-            cache_lines
-        )
-        + "\n\n"
-
-        f"⏳ API cooldown: "
-        f"{cooldown}s\n"
-
-        f"🔄 Refresh: every "
-        f"{AUTO_SCAN_SECONDS}s\n"
-
-        f"🛡 Request gap: "
-        f"{REQUEST_GAP_SECONDS}s\n\n"
-
-        "Rate-limit protection: ACTIVE"
-    )
+    lines.extend([
+        "",
+        f"⏳ API COOLDOWN: {cooldown}s",
+        f"🔄 AUTO SCAN: {AUTO_SCAN_SECONDS}s",
+        f"🛡 REQUEST GAP: {REQUEST_GAP_SECONDS}s",
+    ])
 
     await update.message.reply_text(
-        message
+        "\n".join(lines)
     )
 
 
 # ============================================================
-# /WATCHLIST
+# WATCHLIST
 # ============================================================
 
 async def watchlist_command(
@@ -501,26 +404,21 @@ async def watchlist_command(
 
         if symbol in DATA_CACHE:
 
-            status = "💾 DATA READY"
+            state = "🟢 READY"
 
         else:
 
-            status = "⏳ WAITING"
+            state = "⏳ WAITING"
 
         lines.append(
-            f"{info['emoji']} "
-            f"{symbol}\n"
-            f"   {info['name']} — "
-            f"{status}"
+            f"{info['emoji']} {symbol} — {state}"
         )
 
-    lines.extend(
-        [
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"⚙️ Mode: {MODE}",
-            f"⏱ Timeframe: {TIMEFRAME}",
-        ]
-    )
+    lines.extend([
+        "",
+        f"⚙️ Mode: {MODE}",
+        f"⏱ Timeframe: {TIMEFRAME}",
+    ])
 
     await update.message.reply_text(
         "\n".join(lines)
@@ -528,7 +426,7 @@ async def watchlist_command(
 
 
 # ============================================================
-# /NORMAL
+# NORMAL
 # ============================================================
 
 async def normal_command(
@@ -540,24 +438,21 @@ async def normal_command(
 
     MODE = "NORMAL"
 
-    if not update.message:
-        return
+    if update.message:
 
-    await update.message.reply_text(
-        "👑 KING OF XAU_NAS\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🟢 NORMAL MODE ACTIVATED\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 Minimum confidence: "
-        f"{NORMAL_CONFIDENCE}%\n"
-        f"⏱ Timeframe: {TIMEFRAME}\n\n"
-        "The next scan will use "
-        "the protected market cache."
-    )
+        await update.message.reply_text(
+            "👑 KING OF XAU_NAS\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🟢 NORMAL MODE ACTIVATED\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🎯 Minimum confidence: "
+            f"{NORMAL_CONFIDENCE}%\n"
+            f"⏱ Timeframe: {TIMEFRAME}"
+        )
 
 
 # ============================================================
-# /SCALP
+# SCALP
 # ============================================================
 
 async def scalp_command(
@@ -575,26 +470,24 @@ async def scalp_command(
     await update.message.reply_text(
         "👑 KING OF XAU_NAS\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ SCALPING MODE ACTIVATED\n"
+        "⚡ SCALP MODE ACTIVATED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎯 Minimum confidence: "
         f"{SCALP_CONFIDENCE}%\n"
         f"⏱ Timeframe: {TIMEFRAME}\n\n"
-        "Using cached market data "
-        "where available.\n"
-        "🛡 Rate-limit protection ACTIVE."
+        "Scanning cached market data..."
     )
 
     asyncio.create_task(
-        cached_scan(
+        run_scan(
             context.application,
-            "SCALP",
+            "SCALP"
         )
     )
 
 
 # ============================================================
-# /SCAN
+# SCAN
 # ============================================================
 
 async def scan_command(
@@ -610,105 +503,23 @@ async def scan_command(
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📡 SCAN STARTED\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Checking the four markets.\n"
-        "Rate-limit protection ACTIVE."
+        "🟡 XAU/USD\n"
+        "🇬🇧 GBP/USD\n"
+        "💷 GBP/JPY\n"
+        "🇪🇺 EUR/USD\n\n"
+        "🛡 Rate-limit protection ACTIVE."
     )
 
     asyncio.create_task(
-        controlled_manual_scan(
+        run_scan(
             context.application,
-            MODE,
+            MODE
         )
     )
 
 
 # ============================================================
-# MANUAL SCAN
-# ============================================================
-
-async def controlled_manual_scan(
-    application,
-    mode,
-):
-
-    # First analyze existing cache.
-
-    await analyze_cached_markets(
-        application,
-        mode,
-    )
-
-    # Only refresh markets that are missing
-    # or whose cache is older than CACHE_SECONDS.
-
-    for symbol in MARKETS:
-
-        cached = DATA_CACHE.get(
-            symbol
-        )
-
-        needs_refresh = (
-            cached is None
-            or
-            (
-                time.time()
-                -
-                cached["timestamp"]
-                >
-                CACHE_SECONDS
-            )
-        )
-
-        if not needs_refresh:
-
-            continue
-
-        if time.time() < RATE_LIMIT_UNTIL:
-
-            logger.warning(
-                "API cooldown active. "
-                "Manual refresh stopped."
-            )
-
-            break
-
-        try:
-
-            await asyncio.to_thread(
-                fetch_market_data,
-                symbol,
-            )
-
-        except Exception as error:
-
-            logger.warning(
-                "%s manual refresh failed: %s",
-                symbol,
-                error,
-            )
-
-            if (
-                time.time()
-                <
-                RATE_LIMIT_UNTIL
-            ):
-
-                break
-
-        await asyncio.sleep(
-            REQUEST_GAP_SECONDS
-        )
-
-    # Analyze whatever data we now have.
-
-    await analyze_cached_markets(
-        application,
-        mode,
-    )
-
-
-# ============================================================
-# /SIGNALS
+# SIGNALS
 # ============================================================
 
 async def signals_command(
@@ -729,75 +540,40 @@ async def signals_command(
 
         return
 
-    lines = [
-        "👑 KING OF XAU_NAS — SIGNAL BOARD",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-
     for symbol in MARKETS:
 
         result = LATEST_RESULTS.get(
             symbol
         )
 
-        if result:
+        if not result:
+            continue
 
-            lines.append(
-                f"{result['emoji']} "
-                f"{symbol}: "
-                f"{result['text']}"
+        await update.message.reply_text(
+            build_result_message(
+                symbol,
+                result
             )
-
-        else:
-
-            lines.append(
-                f"{MARKETS[symbol]['emoji']} "
-                f"{symbol}: WAITING"
-            )
-
-    await update.message.reply_text(
-        "\n".join(lines)
-    )
-
+        )
 
 # ============================================================
-# TELEGRAM ERROR HANDLER
+# API RATE LIMIT
 # ============================================================
 
-async def error_handler(
-    update,
-    context,
-):
-
-    logger.error(
-        "Telegram exception: %s",
-        context.error,
-    )
-
-
-# ============================================================
-# API SLOT
-# ============================================================
-
-def wait_for_api_slot():
+def api_slot_available():
 
     global LAST_API_REQUEST
 
-    now = time.time()
-
-    if now < RATE_LIMIT_UNTIL:
+    if time.time() < RATE_LIMIT_UNTIL:
 
         return False
 
     elapsed = (
-        now -
+        time.time() -
         LAST_API_REQUEST
     )
 
-    if (
-        elapsed <
-        REQUEST_GAP_SECONDS
-    ):
+    if elapsed < REQUEST_GAP_SECONDS:
 
         time.sleep(
             REQUEST_GAP_SECONDS -
@@ -810,33 +586,30 @@ def wait_for_api_slot():
 
 
 # ============================================================
-# FETCH TWELVE DATA
+# FETCH DATA
 # ============================================================
 
-def fetch_market_data(
-    symbol,
-):
+def fetch_market_data(symbol):
 
     global RATE_LIMIT_UNTIL
 
     if not TWELVE_DATA_API_KEY:
 
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY "
-            "is missing."
+            "TWELVE_DATA_API_KEY missing."
         )
 
     with API_LOCK:
 
-        if not wait_for_api_slot():
+        if not api_slot_available():
 
             raise RuntimeError(
                 "API cooldown active."
             )
 
         logger.info(
-            "📡 Twelve Data request → %s",
-            symbol,
+            "Requesting %s",
+            symbol
         )
 
         response = requests.get(
@@ -850,10 +623,6 @@ def fetch_market_data(
             timeout=20,
         )
 
-        # ----------------------------------------------------
-        # 429
-        # ----------------------------------------------------
-
         if response.status_code == 429:
 
             RATE_LIMIT_UNTIL = (
@@ -862,57 +631,34 @@ def fetch_market_data(
                 RATE_LIMIT_COOLDOWN_SECONDS
             )
 
-            logger.warning(
-                "🚨 HTTP 429 from Twelve Data."
-            )
-
-            logger.warning(
-                "Pausing API requests for %s seconds.",
-                RATE_LIMIT_COOLDOWN_SECONDS,
-            )
-
             raise RuntimeError(
-                "Twelve Data rate limit."
+                "Twelve Data HTTP 429."
             )
 
         response.raise_for_status()
 
         data = response.json()
 
-        # Twelve Data can return an error
-        # inside a successful HTTP response.
-
-        if "status" in data:
-
-            if str(
-                data.get("status")
-            ).lower() == "error":
-
-                message = data.get(
-                    "message",
-                    "Twelve Data error.",
-                )
-
-                raise RuntimeError(
-                    message
-                )
-
-        if "values" not in data:
-
-            message = data.get(
-                "message",
-                "No values returned.",
-            )
+        if data.get("status") == "error":
 
             raise RuntimeError(
-                message
+                data.get(
+                    "message",
+                    "Twelve Data error"
+                )
             )
 
-        df = pd.DataFrame(
-            data["values"]
-        )
+        values = data.get("values")
 
-        required_columns = [
+        if not values:
+
+            raise RuntimeError(
+                f"No market data for {symbol}"
+            )
+
+        df = pd.DataFrame(values)
+
+        required = [
             "datetime",
             "open",
             "high",
@@ -920,25 +666,24 @@ def fetch_market_data(
             "close",
         ]
 
-        for column in required_columns:
+        for col in required:
 
-            if column not in df.columns:
+            if col not in df.columns:
 
                 raise RuntimeError(
-                    f"{symbol}: missing "
-                    f"{column}"
+                    f"{symbol}: missing {col}"
                 )
 
-        for column in [
+        for col in [
             "open",
             "high",
             "low",
             "close",
         ]:
 
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
             )
 
         df = df.dropna(
@@ -951,50 +696,27 @@ def fetch_market_data(
         )
 
         df = (
-            df
-            .iloc[::-1]
+            df.iloc[::-1]
             .reset_index(drop=True)
         )
 
         if len(df) < 60:
 
             raise RuntimeError(
-                f"{symbol}: only "
-                f"{len(df)} candles."
+                f"{symbol}: insufficient candles."
             )
 
-        DATA_CACHE[
-            symbol
-        ] = {
+        DATA_CACHE[symbol] = {
             "data": df,
             "timestamp": time.time(),
         }
 
         logger.info(
-            "💾 %s cached successfully.",
-            symbol,
+            "Cached %s",
+            symbol
         )
 
         return df
-
-
-# ============================================================
-# CACHE GETTER
-# ============================================================
-
-def get_cached_data(
-    symbol,
-):
-
-    cached = DATA_CACHE.get(
-        symbol
-    )
-
-    if not cached:
-
-        return None
-
-    return cached["data"]
 
 
 # ============================================================
@@ -1005,29 +727,27 @@ def add_indicators(df):
 
     df = df.copy()
 
-    # EMA 20
+    # EMA
 
     df["ema20"] = (
         df["close"]
         .ewm(
             span=20,
-            adjust=False,
+            adjust=False
         )
         .mean()
     )
-
-    # EMA 50
 
     df["ema50"] = (
         df["close"]
         .ewm(
             span=50,
-            adjust=False,
+            adjust=False
         )
         .mean()
     )
 
-    # RSI 14
+    # RSI
 
     delta = df["close"].diff()
 
@@ -1040,29 +760,22 @@ def add_indicators(df):
     )
 
     avg_gain = (
-        gain
-        .ewm(
+        gain.ewm(
             alpha=1 / 14,
-            adjust=False,
-        )
-        .mean()
+            adjust=False
+        ).mean()
     )
 
     avg_loss = (
-        loss
-        .ewm(
+        loss.ewm(
             alpha=1 / 14,
-            adjust=False,
-        )
-        .mean()
+            adjust=False
+        ).mean()
     )
 
-    rs = (
-        avg_gain /
-        avg_loss.replace(
-            0,
-            float("nan"),
-        )
+    rs = avg_gain / avg_loss.replace(
+        0,
+        float("nan")
     )
 
     df["rsi"] = (
@@ -1073,16 +786,12 @@ def add_indicators(df):
         )
     )
 
-    df["rsi"] = (
-        df["rsi"]
-        .fillna(50)
-    )
+    df["rsi"] = df["rsi"].fillna(50)
 
-    # ATR 14
+    # ATR
 
     previous_close = (
-        df["close"]
-        .shift(1)
+        df["close"].shift(1)
     )
 
     tr1 = (
@@ -1101,19 +810,15 @@ def add_indicators(df):
     ).abs()
 
     true_range = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3,
-        ],
-        axis=1,
+        [tr1, tr2, tr3],
+        axis=1
     ).max(axis=1)
 
     df["atr"] = (
         true_range
         .ewm(
             alpha=1 / 14,
-            adjust=False,
+            adjust=False
         )
         .mean()
     )
@@ -1122,103 +827,63 @@ def add_indicators(df):
 
 
 # ============================================================
-# BOS
+# MARKET STRUCTURE
 # ============================================================
 
-def detect_bos(df):
-
-    if len(df) < 10:
-
-        return None
-
-    previous_high = (
-        df["high"]
-        .iloc[-6:-1]
-        .max()
-    )
-
-    previous_low = (
-        df["low"]
-        .iloc[-6:-1]
-        .min()
-    )
+def structure_signal(df):
 
     last = df.iloc[-1]
 
-    if last["close"] > previous_high:
+    previous = df.iloc[-6:-1]
 
+    buy = False
+    sell = False
+
+    # Break of structure
+
+    if last["close"] > previous["high"].max():
+
+        buy = True
+
+    if last["close"] < previous["low"].min():
+
+        sell = True
+
+    if buy and not sell:
         return "BUY"
 
-    if last["close"] < previous_low:
-
+    if sell and not buy:
         return "SELL"
 
     return None
 
 
-# ============================================================
-# CHOCH
-# ============================================================
-
-def detect_choch(df):
-
-    if len(df) < 10:
-
-        return None
-
-    previous = df.iloc[-8:-1]
+def liquidity_signal(df):
 
     last = df.iloc[-1]
 
-    if (
-        last["close"]
-        >
-        previous["high"].max()
-    ):
+    previous = df.iloc[-16:-1]
 
-        return "BUY"
+    previous_high = previous["high"].max()
 
-    if (
-        last["close"]
-        <
-        previous["low"].min()
-    ):
+    previous_low = previous["low"].min()
 
-        return "SELL"
-
-    return None
-
-
-# ============================================================
-# LIQUIDITY SWEEP
-# ============================================================
-
-def detect_liquidity(df):
-
-    if len(df) < 20:
-
-        return None
-
-    recent = df.iloc[-16:-1]
-
-    last = df.iloc[-1]
-
-    high = recent["high"].max()
-
-    low = recent["low"].min()
+    # Bearish sweep
 
     if (
-        last["high"] > high
+        last["high"] > previous_high
         and
-        last["close"] < high
+        last["close"] < previous_high
     ):
 
         return "SELL"
 
+    # Bullish sweep
+
     if (
-        last["low"] < low
+        last["low"] < previous_low
         and
-        last["close"] > low
+        last["close"] > previous_low
     ):
 
         return "BUY"
@@ -1226,38 +891,31 @@ def detect_liquidity(df):
     return None
 
 
-# ============================================================
-# FVG
-# ============================================================
-
-def detect_fvg(df):
+def fvg_signal(df):
 
     if len(df) < 5:
-
         return None
 
-    first = df.iloc[-3]
+    a = df.iloc[-3]
+    b = df.iloc[-2]
+    c = df.iloc[-1]
 
-    middle = df.iloc[-2]
-
-    last = df.iloc[-1]
+    # Bullish FVG
 
     if (
-        last["low"] > first["high"]
+        c["low"] > a["high"]
         and
-        middle["close"]
-        >
-        middle["open"]
+        b["close"] > b["open"]
     ):
 
         return "BUY"
 
+    # Bearish FVG
+
     if (
-        last["high"] < first["low"]
+        c["high"] < a["low"]
         and
-        middle["close"]
-        <
-        middle["open"]
+        b["close"] < b["open"]
     ):
 
         return "SELL"
@@ -1265,41 +923,23 @@ def detect_fvg(df):
     return None
 
 
-# ============================================================
-# MOMENTUM
-# ============================================================
-
-def detect_momentum(df):
-
-    if len(df) < 3:
-
-        return None
+def momentum_signal(df):
 
     last = df.iloc[-1]
 
     previous = df.iloc[-2]
 
-    if (
-        last["close"]
-        >
-        previous["close"]
-    ):
-
+    if last["close"] > previous["close"]:
         return "BUY"
 
-    if (
-        last["close"]
-        <
-        previous["close"]
-    ):
-
+    if last["close"] < previous["close"]:
         return "SELL"
 
     return None
 
 
 # ============================================================
-# SIGNAL ENGINE
+# BALANCED SIGNAL ENGINE
 # ============================================================
 
 def calculate_signal(
@@ -1309,147 +949,158 @@ def calculate_signal(
 
     last = df.iloc[-1]
 
-    price = float(
-        last["close"]
-    )
+    price = float(last["close"])
 
-    ema20 = float(
-        last["ema20"]
-    )
+    ema20 = float(last["ema20"])
 
-    ema50 = float(
-        last["ema50"]
-    )
+    ema50 = float(last["ema50"])
 
-    rsi = float(
-        last["rsi"]
-    )
+    rsi = float(last["rsi"])
 
-    atr = float(
-        last["atr"]
-    )
+    atr = float(last["atr"])
 
     if atr <= 0:
+        return None
 
-        return (
-            None,
-            0,
-            "Invalid ATR",
-        )
+    buy_score = 0
+    sell_score = 0
 
-    bos = detect_bos(df)
-
-    choch = detect_choch(df)
-
-    liquidity = detect_liquidity(df)
-
-    fvg = detect_fvg(df)
-
-    momentum = detect_momentum(df)
-
-    buy = 0
-
-    sell = 0
+    reasons_buy = []
+    reasons_sell = []
 
     # --------------------------------------------------------
-    # TREND
+    # EMA TREND
     # --------------------------------------------------------
 
     if ema20 > ema50:
 
-        buy += 20
+        buy_score += 20
+        reasons_buy.append("EMA trend")
 
     elif ema20 < ema50:
 
-        sell += 20
+        sell_score += 20
+        reasons_sell.append("EMA trend")
+
+    # --------------------------------------------------------
+    # PRICE VS EMA20
+    # --------------------------------------------------------
+
+    if price > ema20:
+
+        buy_score += 10
+        reasons_buy.append("Price above EMA20")
+
+    elif price < ema20:
+
+        sell_score += 10
+        reasons_sell.append("Price below EMA20")
 
     # --------------------------------------------------------
     # RSI
+    # Balanced BUY and SELL conditions
     # --------------------------------------------------------
 
-    if 52 <= rsi <= 70:
+    if 52 <= rsi <= 68:
 
-        buy += 15
+        buy_score += 15
+        reasons_buy.append("Bullish RSI")
 
-    elif 30 <= rsi <= 48:
+    elif 32 <= rsi <= 48:
 
-        sell += 15
-
-    # --------------------------------------------------------
-    # BOS
-    # --------------------------------------------------------
-
-    if bos == "BUY":
-
-        buy += 15
-
-    elif bos == "SELL":
-
-        sell += 15
+        sell_score += 15
+        reasons_sell.append("Bearish RSI")
 
     # --------------------------------------------------------
-    # CHOCH
+    # STRUCTURE
     # --------------------------------------------------------
 
-    if choch == "BUY":
+    structure = structure_signal(df)
 
-        buy += 15
+    if structure == "BUY":
 
-    elif choch == "SELL":
+        buy_score += 20
+        reasons_buy.append("BOS BUY")
 
-        sell += 15
+    elif structure == "SELL":
 
-    # --------------------------------------------------------
-    # FVG
-    # --------------------------------------------------------
-
-    if fvg == "BUY":
-
-        buy += 15
-
-    elif fvg == "SELL":
-
-        sell += 15
+        sell_score += 20
+        reasons_sell.append("BOS SELL")
 
     # --------------------------------------------------------
     # LIQUIDITY
     # --------------------------------------------------------
 
+    liquidity = liquidity_signal(df)
+
     if liquidity == "BUY":
 
-        buy += 10
+        buy_score += 10
+        reasons_buy.append("Bullish liquidity")
 
     elif liquidity == "SELL":
 
-        sell += 10
+        sell_score += 10
+        reasons_sell.append("Bearish liquidity")
+
+    # --------------------------------------------------------
+    # FVG
+    # --------------------------------------------------------
+
+    fvg = fvg_signal(df)
+
+    if fvg == "BUY":
+
+        buy_score += 10
+        reasons_buy.append("Bullish FVG")
+
+    elif fvg == "SELL":
+
+        sell_score += 10
+        reasons_sell.append("Bearish FVG")
 
     # --------------------------------------------------------
     # MOMENTUM
     # --------------------------------------------------------
 
+    momentum = momentum_signal(df)
+
     if momentum == "BUY":
 
-        buy += 10
+        buy_score += 10
+        reasons_buy.append("Bullish momentum")
 
     elif momentum == "SELL":
 
-        sell += 10
+        sell_score += 10
+        reasons_sell.append("Bearish momentum")
 
     # --------------------------------------------------------
-    # SELECT SIDE
+    # CHOOSE SIDE
     # --------------------------------------------------------
 
-    if buy >= sell:
+    if buy_score > sell_score:
 
         side = "BUY"
+        score = buy_score
+        reasons = reasons_buy
 
-        confidence = buy
+    elif sell_score > buy_score:
+
+        side = "SELL"
+        score = sell_score
+        reasons = reasons_sell
 
     else:
 
-        side = "SELL"
+        return None
 
-        confidence = sell
+    # --------------------------------------------------------
+    # CONFIDENCE
+    # --------------------------------------------------------
+
+    # Prevents a weak side winning just because
+    # the other side is also weak.
 
     if mode == "SCALP":
 
@@ -1459,91 +1110,76 @@ def calculate_signal(
 
         threshold = NORMAL_CONFIDENCE
 
-    if confidence < threshold:
+    if score < threshold:
 
-        return (
-            None,
-            confidence,
-            (
-                f"No qualifying {side} "
-                f"signal: "
-                f"{confidence}%/"
-                f"{threshold}%"
-            ),
-        )
+        return None
 
     # --------------------------------------------------------
-    # TARGETS
+    # ATR TARGETS
     # --------------------------------------------------------
 
     if mode == "SCALP":
 
-        sl_mult = 1.0
-
-        tp1_mult = 1.2
-
-        tp2_mult = 1.8
-
-        tp3_mult = 2.5
+        sl_multiplier = 1.0
+        tp1_multiplier = 1.2
+        tp2_multiplier = 1.8
+        tp3_multiplier = 2.5
 
     else:
 
-        sl_mult = 1.5
-
-        tp1_mult = 2.0
-
-        tp2_mult = 3.0
-
-        tp3_mult = 5.0
+        sl_multiplier = 1.5
+        tp1_multiplier = 2.0
+        tp2_multiplier = 3.0
+        tp3_multiplier = 4.5
 
     if side == "BUY":
 
         sl = (
             price -
-            atr * sl_mult
+            atr * sl_multiplier
         )
 
         tp1 = (
             price +
-            atr * tp1_mult
+            atr * tp1_multiplier
         )
 
         tp2 = (
             price +
-            atr * tp2_mult
+            atr * tp2_multiplier
         )
 
         tp3 = (
             price +
-            atr * tp3_mult
+            atr * tp3_multiplier
         )
 
     else:
 
         sl = (
             price +
-            atr * sl_mult
+            atr * sl_multiplier
         )
 
         tp1 = (
             price -
-            atr * tp1_mult
+            atr * tp1_multiplier
         )
 
         tp2 = (
             price -
-            atr * tp2_mult
+            atr * tp2_multiplier
         )
 
         tp3 = (
             price -
-            atr * tp3_mult
+            atr * tp3_multiplier
         )
 
-    signal = {
+    return {
         "side": side,
-        "confidence": confidence,
-        "price": price,
+        "confidence": score,
+        "entry": price,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -1552,26 +1188,21 @@ def calculate_signal(
         "ema50": ema50,
         "rsi": rsi,
         "atr": atr,
-        "bos": bos,
-        "choch": choch,
+        "structure": structure,
         "liquidity": liquidity,
         "fvg": fvg,
         "momentum": momentum,
+        "reasons": reasons,
         "mode": mode,
+        "candle": str(last["datetime"]),
     }
 
-    return (
-        signal,
-        confidence,
-        f"{side} SIGNAL",
-    )
-
 
 # ============================================================
-# PRICE FORMAT
+# FORMAT PRICE
 # ============================================================
 
-def fmt(
+def price_fmt(
     symbol,
     value,
 ):
@@ -1580,13 +1211,11 @@ def fmt(
         symbol
     ]["digits"]
 
-    return (
-        f"{value:,.{digits}f}"
-    )
+    return f"{value:,.{digits}f}"
 
 
 # ============================================================
-# BUILD SIGNAL MESSAGE
+# FULL SIGNAL MESSAGE
 # ============================================================
 
 def build_signal_message(
@@ -1594,107 +1223,87 @@ def build_signal_message(
     signal,
 ):
 
-    info = MARKETS[
-        symbol
-    ]
+    info = MARKETS[symbol]
 
-    side = signal[
-        "side"
-    ]
+    side = signal["side"]
 
-    direction = (
-        "🟢"
-        if side == "BUY"
-        else "🔴"
+    if side == "BUY":
+
+        direction = "🟢 BUY"
+
+    else:
+
+        direction = "🔴 SELL"
+
+    reasons = ", ".join(
+        signal["reasons"]
     )
 
-    timestamp = (
-        datetime
-        .now(timezone.utc)
-        .strftime(
-            "%Y-%m-%d %H:%M UTC"
-        )
+    now = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M UTC"
     )
-
-    def mark(value):
-
-        if value == side:
-
-            return "✅"
-
-        return "—"
 
     return (
         "👑 KING OF XAU_NAS\n"
-        f"{info['emoji']} "
-        f"{symbol} — "
+        f"{info['emoji']} {symbol} — "
         f"{info['name']}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚨 SIGNAL CONFIRMED — {direction}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"{direction} "
-        f"SIGNAL CONFIRMED — "
-        f"{side}\n"
+        f"⚙️ Mode: {signal['mode']}\n"
+        f"💯 Confidence: {signal['confidence']}%\n"
+        f"⏱ Timeframe: {TIMEFRAME}\n\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 ENTRY: "
+        f"{price_fmt(symbol, signal['entry'])}\n"
 
-        f"⚙️ Mode: "
-        f"{signal['mode']}\n"
+        f"🛑 STOP LOSS: "
+        f"{price_fmt(symbol, signal['sl'])}\n"
 
-        f"💯 Confidence: "
-        f"{signal['confidence']}%\n"
+        f"🎯 TAKE PROFIT 1: "
+        f"{price_fmt(symbol, signal['tp1'])}\n"
 
-        f"💰 Entry: "
-        f"{fmt(symbol, signal['price'])}\n"
+        f"🎯 TAKE PROFIT 2: "
+        f"{price_fmt(symbol, signal['tp2'])}\n"
 
-        f"🛑 Stop Loss: "
-        f"{fmt(symbol, signal['sl'])}\n"
-
-        f"🎯 Take Profit 1: "
-        f"{fmt(symbol, signal['tp1'])}\n"
-
-        f"🎯 Take Profit 2: "
-        f"{fmt(symbol, signal['tp2'])}\n"
-
-        f"🎯 Take Profit 3: "
-        f"{fmt(symbol, signal['tp3'])}\n"
+        f"🎯 TAKE PROFIT 3: "
+        f"{price_fmt(symbol, signal['tp3'])}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"📊 EMA20: "
-        f"{fmt(symbol, signal['ema20'])}\n"
+        f"{price_fmt(symbol, signal['ema20'])}\n"
 
         f"📊 EMA50: "
-        f"{fmt(symbol, signal['ema50'])}\n"
+        f"{price_fmt(symbol, signal['ema50'])}\n"
 
         f"📈 RSI14: "
         f"{signal['rsi']:.1f}\n"
 
         f"⚡ ATR14: "
-        f"{fmt(symbol, signal['atr'])}\n"
+        f"{price_fmt(symbol, signal['atr'])}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
         f"🏗 BOS: "
-        f"{mark(signal['bos'])}\n"
-
-        f"🔄 CHoCH: "
-        f"{mark(signal['choch'])}\n"
+        f"{signal['structure'] or 'NONE'}\n"
 
         f"💧 Liquidity: "
-        f"{mark(signal['liquidity'])}\n"
+        f"{signal['liquidity'] or 'NONE'}\n"
 
         f"📦 FVG: "
-        f"{mark(signal['fvg'])}\n"
+        f"{signal['fvg'] or 'NONE'}\n"
 
         f"⚡ Momentum: "
-        f"{mark(signal['momentum'])}\n"
+        f"{signal['momentum'] or 'NONE'}\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
-        f"⏱ Timeframe: "
-        f"{TIMEFRAME}\n"
-
-        f"🕐 {timestamp}\n\n"
+        f"🧠 Reasons: {reasons}\n"
+        f"🕐 {now}\n\n"
 
         "⚠️ Analysis only — "
         "not financial advice."
@@ -1702,219 +1311,171 @@ def build_signal_message(
 
 
 # ============================================================
-# ANALYZE ONE CACHED MARKET
+# RESULT MESSAGE
+# ============================================================
+
+def build_result_message(
+    symbol,
+    result,
+):
+
+    info = MARKETS[symbol]
+
+    if result.get("signal"):
+
+        return build_signal_message(
+            symbol,
+            result["signal"]
+        )
+
+    return (
+        "👑 KING OF XAU_NAS\n"
+        f"{info['emoji']} {symbol}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⏳ NO QUALIFYING SIGNAL\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Price: "
+        f"{price_fmt(symbol, result['price'])}\n"
+        f"📊 EMA20: "
+        f"{price_fmt(symbol, result['ema20'])}\n"
+        f"📊 EMA50: "
+        f"{price_fmt(symbol, result['ema50'])}\n"
+        f"📈 RSI: {result['rsi']:.1f}\n"
+        f"⚡ ATR: "
+        f"{price_fmt(symbol, result['atr'])}\n\n"
+        "Waiting for a stronger setup."
+    )
+
+
+# ============================================================
+# ANALYZE MARKET
 # ============================================================
 
 async def analyze_market(
     application,
     symbol,
     mode,
+    send_signal=True,
 ):
 
     try:
 
-        df = get_cached_data(
+        cached = DATA_CACHE.get(
             symbol
         )
 
-        if df is None:
-
-            LATEST_RESULTS[
-                symbol
-            ] = {
-                "emoji": MARKETS[
-                    symbol
-                ]["emoji"],
-                "text": "WAITING FOR DATA",
-            }
+        if not cached:
 
             return None
 
         df = add_indicators(
-            df
-        )
-
-        signal, confidence, reason = (
-            calculate_signal(
-                df,
-                mode,
-            )
+            cached["data"]
         )
 
         last = df.iloc[-1]
 
-        price = float(
-            last["close"]
+        signal = calculate_signal(
+            df,
+            mode
         )
 
-        logger.info(
-            "%s → %s | Price=%s",
-            symbol,
-            reason,
-            fmt(
-                symbol,
-                price,
-            ),
-        )
+        # ----------------------------------------------------
+        # Store result even when there is no signal.
+        # ----------------------------------------------------
 
-        if signal is None:
+        base_result = {
+            "signal": signal,
+            "price": float(last["close"]),
+            "ema20": float(last["ema20"]),
+            "ema50": float(last["ema50"]),
+            "rsi": float(last["rsi"]),
+            "atr": float(last["atr"]),
+            "timestamp": time.time(),
+        }
 
-            LATEST_RESULTS[
+        LATEST_RESULTS[symbol] = base_result
+
+        if not signal:
+
+            logger.info(
+                "%s → NO QUALIFYING SIGNAL",
                 symbol
-            ] = {
-                "emoji": MARKETS[
-                    symbol
-                ]["emoji"],
-                "text": reason,
-            }
+            )
 
             return None
 
-        candle_time = str(
-            last["datetime"]
-        )
+        # ----------------------------------------------------
+        # Prevent duplicate candle signals.
+        # ----------------------------------------------------
 
         signal_key = (
-            f"{mode}:"
-            f"{symbol}:"
-            f"{candle_time}:"
-            f"{signal['side']}"
+            f"{symbol}|"
+            f"{mode}|"
+            f"{signal['side']}|"
+            f"{signal['candle']}"
         )
 
-        LATEST_RESULTS[
-            symbol
-        ] = {
-            "emoji": MARKETS[
-                symbol
-            ]["emoji"],
-            "text": (
-                f"{signal['side']} "
-                f"{confidence}%"
-            ),
-        }
-
-        # Don't send the same signal repeatedly.
-
         if (
-            LAST_SIGNALS.get(
-                symbol
-            )
+            LAST_SIGNAL_KEYS.get(symbol)
             ==
             signal_key
         ):
 
             logger.info(
-                "%s → duplicate "
-                "signal skipped.",
-                symbol,
+                "%s → duplicate skipped",
+                symbol
             )
 
             return signal
 
-        LAST_SIGNALS[
-            symbol
-        ] = signal_key
-
-        message = (
-            build_signal_message(
-                symbol,
-                signal,
-            )
-        )
-
-        await send_telegram(
-            application,
-            message,
+        LAST_SIGNAL_KEYS[symbol] = (
+            signal_key
         )
 
         logger.info(
-            "🚨 %s %s SIGNAL SENT",
+            "%s → %s %s%%",
             symbol,
             signal["side"],
+            signal["confidence"]
         )
+
+        if send_signal:
+
+            await send_message(
+                application,
+                build_signal_message(
+                    symbol,
+                    signal
+                )
+            )
 
         return signal
 
-    except Exception as error:
+    except Exception as e:
 
-        logger.warning(
+        logger.error(
             "%s analysis error: %s",
             symbol,
-            error,
+            e
         )
 
         return None
 
 
 # ============================================================
-# ANALYZE ALL CACHED DATA
-# ============================================================
-
-async def analyze_cached_markets(
-    application,
-    mode,
-):
-
-    logger.info(
-        "Analyzing cached markets..."
-    )
-
-    signals = 0
-
-    for symbol in MARKETS:
-
-        result = await analyze_market(
-            application,
-            symbol,
-            mode,
-        )
-
-        if result:
-
-            signals += 1
-
-        await asyncio.sleep(
-            0.2
-        )
-
-    logger.info(
-        "Cached analysis complete. "
-        "Signals: %s",
-        signals,
-    )
-
-
-# ============================================================
-# REFRESH ONLY OLD/MISSING DATA
+# REFRESH MARKET DATA
 # ============================================================
 
 async def refresh_markets():
-
-    logger.info(
-        "Starting controlled market refresh."
-    )
 
     refreshed = 0
 
     for symbol in MARKETS:
 
-        # Stop immediately during 429 cooldown.
-
-        if (
-            time.time()
-            <
-            RATE_LIMIT_UNTIL
-        ):
-
-            remaining = int(
-                RATE_LIMIT_UNTIL -
-                time.time()
-            )
+        if time.time() < RATE_LIMIT_UNTIL:
 
             logger.warning(
-                "429 cooldown active: "
-                "%ss",
-                remaining,
+                "429 cooldown active."
             )
 
             break
@@ -1922,9 +1483,6 @@ async def refresh_markets():
         cached = DATA_CACHE.get(
             symbol
         )
-
-        # Don't request a market if
-        # its cache is still fresh.
 
         if cached:
 
@@ -1937,10 +1495,8 @@ async def refresh_markets():
             if age < CACHE_SECONDS:
 
                 logger.info(
-                    "%s → cache fresh "
-                    "(%ss old)",
-                    symbol,
-                    int(age),
+                    "%s cache still fresh.",
+                    symbol
                 )
 
                 continue
@@ -1949,71 +1505,82 @@ async def refresh_markets():
 
             await asyncio.to_thread(
                 fetch_market_data,
-                symbol,
+                symbol
             )
 
             refreshed += 1
 
-        except Exception as error:
+        except Exception as e:
 
             logger.warning(
                 "%s refresh failed: %s",
                 symbol,
-                error,
+                e
             )
 
-            if (
-                time.time()
-                <
-                RATE_LIMIT_UNTIL
-            ):
+            if time.time() < RATE_LIMIT_UNTIL:
 
                 break
-
-        # Mandatory gap.
 
         await asyncio.sleep(
             REQUEST_GAP_SECONDS
         )
 
-    logger.info(
-        "Refresh complete: "
-        "%s/%s requested",
-        refreshed,
-        len(MARKETS),
-    )
+    return refreshed
 
 
 # ============================================================
 # FULL SCAN
 # ============================================================
 
-async def full_scan(
+async def run_scan(
     application,
     mode,
 ):
 
-    # Analyze existing data FIRST.
-
-    await analyze_cached_markets(
-        application,
-        mode,
+    logger.info(
+        "Starting %s scan.",
+        mode
     )
 
-    # Then refresh only stale data.
+    # Analyze cache first.
+
+    for symbol in MARKETS:
+
+        await analyze_market(
+            application,
+            symbol,
+            mode,
+            send_signal=True
+        )
+
+        await asyncio.sleep(0.2)
+
+    # Refresh stale data.
 
     await refresh_markets()
 
-    # Analyze refreshed data.
+    # Analyze fresh data.
 
-    await analyze_cached_markets(
-        application,
-        mode,
+    for symbol in MARKETS:
+
+        await analyze_market(
+            application,
+            symbol,
+            mode,
+            send_signal=True
+        )
+
+        await asyncio.sleep(0.2)
+
+    logger.info(
+        "%s scan complete.",
+        mode
     )
 
 
 # ============================================================
-# AUTOMATIC SCANNER
+# BACKGROUND SCANNER
 # ============================================================
 
 async def scanner_loop(
@@ -2024,80 +1591,24 @@ async def scanner_loop(
 
     SCANNER_RUNNING = True
 
-    logger.info(
-        "===================================="
-    )
-
-    logger.info(
-        "👑 KING OF XAU_NAS SCANNER ONLINE"
-    )
-
-    logger.info(
-        "Markets: %s",
-        ", ".join(
-            MARKETS.keys()
-        ),
-    )
-
-    logger.info(
-        "Mode: %s",
-        MODE,
-    )
-
-    logger.info(
-        "Refresh interval: %ss",
-        AUTO_SCAN_SECONDS,
-    )
-
-    logger.info(
-        "Request gap: %ss",
-        REQUEST_GAP_SECONDS,
-    )
-
-    logger.info(
-        "===================================="
-    )
-
     while True:
-
-        start_time = time.time()
 
         try:
 
-            current_mode = MODE
-
-            await full_scan(
+            await run_scan(
                 application,
-                current_mode,
+                MODE
             )
 
-        except Exception as error:
+        except Exception as e:
 
             logger.error(
                 "Scanner error: %s",
-                error,
+                e
             )
 
-        elapsed = (
-            time.time()
-            -
-            start_time
-        )
-
-        wait_time = max(
-            15,
-            AUTO_SCAN_SECONDS
-            -
-            int(elapsed),
-        )
-
-        logger.info(
-            "Next scan in %ss",
-            wait_time,
-        )
-
         await asyncio.sleep(
-            wait_time
+            AUTO_SCAN_SECONDS
         )
 
 
@@ -2115,13 +1626,24 @@ async def post_init(
         )
     )
 
-    logger.info(
-        "Background scanner started."
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update,
+    context,
+):
+
+    logger.error(
+        "Telegram error: %s",
+        context.error
     )
 
 
 # ============================================================
-# CONFIG
+# VALIDATE
 # ============================================================
 
 def validate_config():
@@ -2143,9 +1665,8 @@ def validate_config():
     if missing:
 
         raise RuntimeError(
-            "Missing environment variables: "
-            +
-            ", ".join(missing)
+            "Missing: "
+            + ", ".join(missing)
         )
 
 
@@ -2162,125 +1683,82 @@ def main():
     )
 
     logger.info(
-        "👑 KING OF XAU_NAS"
+        "👑 KING OF XAU_NAS STARTING"
     )
 
     logger.info(
-        "4-MARKET VERSION"
-    )
-
-    logger.info(
-        "===================================="
-    )
-
-    logger.info(
-        "Active markets: %s",
-        ", ".join(
-            MARKETS.keys()
-        ),
-    )
-
-    logger.info(
-        "Timeframe: %s",
-        TIMEFRAME,
-    )
-
-    logger.info(
-        "Automatic scan: %ss",
-        AUTO_SCAN_SECONDS,
-    )
-
-    logger.info(
-        "Request gap: %ss",
-        REQUEST_GAP_SECONDS,
-    )
-
-    logger.info(
-        "429 cooldown: %ss",
-        RATE_LIMIT_COOLDOWN_SECONDS,
+        "Markets: %s",
+        ", ".join(MARKETS.keys())
     )
 
     logger.info(
         "===================================="
     )
 
-    # --------------------------------------------------------
-    # WEB SERVER
-    # --------------------------------------------------------
+    # Render health server
 
-    web_thread = Thread(
+    Thread(
         target=run_web_server,
-        daemon=True,
-    )
+        daemon=True
+    ).start()
 
-    web_thread.start()
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
+    # Telegram
 
     application = (
-        Application
-        .builder()
-        .token(
-            TELEGRAM_BOT_TOKEN
-        )
-        .post_init(
-            post_init
-        )
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
+    # Commands
 
     application.add_handler(
         CommandHandler(
             "start",
-            start_command,
+            start_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "status",
-            status_command,
+            status_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "watchlist",
-            watchlist_command,
+            watchlist_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "scan",
-            scan_command,
+            scan_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "scalp",
-            scalp_command,
+            scalp_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "normal",
-            normal_command,
+            normal_command
         )
     )
 
     application.add_handler(
         CommandHandler(
             "signals",
-            signals_command,
+            signals_command
         )
     )
 
@@ -2289,19 +1767,14 @@ def main():
     )
 
     logger.info(
-        "🚀 Telegram polling starting..."
+        "🚀 Telegram bot online."
     )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        drop_pending_updates=True
     )
 
 
-# ============================================================
-# START BOT
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
