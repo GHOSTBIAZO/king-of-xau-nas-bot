@@ -3,10 +3,13 @@ import json
 import time
 import asyncio
 import logging
+import threading
+
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,10 +17,11 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
 # ============================================================
-# 👑 KING OF XAU_NAS — GOLD
-# ADVANCED CONFIRMATION ENGINE
-# RENDER + TELEGRAM VERSION
+# 👑 KING OF XAU_NAS AI — GOLD
+# ADVANCED CONFIRMATION + SCALPING ENGINE
+# TELEGRAM / RENDER VERSION
 # ============================================================
 
 BOT_NAME = "👑 KING OF XAU_NAS — GOLD"
@@ -36,16 +40,48 @@ PORT = int(
     os.getenv("PORT", "10000")
 )
 
+
 # ============================================================
-# MARKET SETTINGS
+# MARKET SETTINGS — NORMAL ENGINE
 # ============================================================
 
 XAU_SYMBOL = "XAU/USD"
-INTERVAL = "15min"
-OUTPUT_SIZE = 100
 
-# Scan every 5 minutes
+NORMAL_INTERVAL = "15min"
+NORMAL_OUTPUT_SIZE = 100
+
 SCAN_INTERVAL_SECONDS = 300
+
+
+# ============================================================
+# MARKET SETTINGS — SCALPING ENGINE
+# ============================================================
+
+SCALP_FAST_INTERVAL = "1min"
+SCALP_TREND_INTERVAL = "5min"
+
+SCALP_FAST_OUTPUT_SIZE = 150
+SCALP_TREND_OUTPUT_SIZE = 100
+
+# Automatic scalp scanner checks every minute.
+SCALP_SCAN_INTERVAL_SECONDS = 60
+
+# Minimum confidence required before automatic scalp alert.
+SCALP_MIN_CONFIDENCE = 80
+
+# Minimum time between repeated scalp alerts.
+SCALP_COOLDOWN_SECONDS = 300
+
+# ATR multipliers.
+SCALP_SL_ATR_MULTIPLIER = 1.20
+SCALP_TP1_ATR_MULTIPLIER = 0.80
+SCALP_TP2_ATR_MULTIPLIER = 1.50
+SCALP_TP3_ATR_MULTIPLIER = 2.20
+
+# Maximum distance from EMA21 in ATR units.
+# Prevents chasing extremely extended candles.
+SCALP_MAX_EXTENSION_ATR = 1.50
+
 
 # ============================================================
 # STORAGE
@@ -53,12 +89,11 @@ SCAN_INTERVAL_SECONDS = 300
 
 CHAT_ID_FILE = "telegram_chat_id.json"
 
-# Runtime Chat ID
-# This is updated immediately when /start is used.
 TELEGRAM_CHAT_ID = None
 
+
 # ============================================================
-# ALERT STATE
+# NORMAL ALERT STATE
 # ============================================================
 
 last_confirmed_key = None
@@ -68,6 +103,20 @@ last_setup_key = None
 last_setup_stage = None
 
 scanner_running = False
+
+
+# ============================================================
+# SCALPING ALERT STATE
+# ============================================================
+
+scalp_enabled = True
+scalp_scanner_running = False
+
+last_scalp_key = None
+last_scalp_time = 0
+
+last_scalp_stage = None
+
 
 # ============================================================
 # LOGGING
@@ -80,6 +129,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(BOT_NAME)
 
+
 # ============================================================
 # FLASK
 # ============================================================
@@ -89,11 +139,12 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
+
     return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>King of XAU_NAS</title>
+        <title>King of XAU_NAS AI</title>
         <meta name="viewport"
               content="width=device-width, initial-scale=1">
     </head>
@@ -106,13 +157,13 @@ def home():
         padding-top:50px;
     ">
 
-        <h1>👑 KING OF XAU_NAS — GOLD</h1>
+        <h1>👑 KING OF XAU_NAS AI</h1>
 
         <h2>🟢 BOT ONLINE</h2>
 
         <p>🟡 XAU/USD</p>
-        <p>⏱ 15 Minute Analysis</p>
-        <p>🧠 Advanced Confirmation Engine</p>
+        <p>🧠 15M Confirmation Engine</p>
+        <p>⚡ 1M/5M Scalping Engine</p>
         <p>🤖 Automatic Scanner</p>
 
     </body>
@@ -122,19 +173,21 @@ def home():
 
 @app.route("/health")
 def health():
+
     return {
         "status": "online",
         "bot": BOT_NAME,
         "market": XAU_SYMBOL,
-        "timeframe": INTERVAL,
-        "scanner": scanner_running,
+        "normal_timeframe": NORMAL_INTERVAL,
+        "scalp_fast_timeframe": SCALP_FAST_INTERVAL,
+        "scalp_trend_timeframe": SCALP_TREND_INTERVAL,
+        "normal_scanner": scanner_running,
+        "scalp_scanner": scalp_scanner_running,
+        "scalp_enabled": scalp_enabled,
     }
 
 
 def run_flask():
-    """
-    Render requires the application to listen on $PORT.
-    """
 
     try:
 
@@ -164,7 +217,6 @@ def load_chat_id():
 
     global TELEGRAM_CHAT_ID
 
-    # First use runtime value
     if TELEGRAM_CHAT_ID:
 
         return str(
@@ -231,8 +283,7 @@ def save_chat_id(chat_id):
 
             json.dump(
                 {
-                    "chat_id":
-                        TELEGRAM_CHAT_ID,
+                    "chat_id": TELEGRAM_CHAT_ID,
                     "saved_at":
                         datetime.now(
                             timezone.utc
@@ -255,7 +306,6 @@ def save_chat_id(chat_id):
             f"Chat ID save error: {e}"
         )
 
-        # Runtime ID is still retained
         TELEGRAM_CHAT_ID = str(
             chat_id
         )
@@ -324,9 +374,7 @@ async def start_command(
 
         return
 
-    chat_id = (
-        update.effective_chat.id
-    )
+    chat_id = update.effective_chat.id
 
     username = "Telegram User"
 
@@ -345,35 +393,47 @@ async def start_command(
                 update.effective_user.first_name
             )
 
-    # Automatically capture Chat ID
     save_chat_id(chat_id)
 
     message = (
-        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+        "👑 *KING OF XAU_NAS AI* 👑\n\n"
 
         "🟢 *BOT CONNECTED*\n\n"
 
         f"👤 User: {username}\n"
         f"🆔 Chat ID: `{chat_id}`\n\n"
 
-        "✅ *Chat ID automatically detected.*\n"
-        "✅ *Telegram alerts are now enabled.*\n\n"
+        "✅ Chat ID automatically detected.\n"
+        "✅ Telegram alerts enabled.\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🟡 *MARKET*\n"
+        "🟡 *NORMAL AI ENGINE*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
         "Market: *XAU/USD*\n"
         "Timeframe: *15 Minutes*\n"
-        "Automatic Scanner: *ON*\n"
         "Confirmation Engine: *ON*\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ *SCALPING ENGINE*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Trend TF: *5 Minutes*\n"
+        "Trigger TF: *1 Minute*\n"
+        f"Minimum Confidence: *{SCALP_MIN_CONFIDENCE}%*\n"
+        f"Automatic Scalping: "
+        f"*{'ON' if scalp_enabled else 'OFF'}*\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📱 *COMMANDS*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "/scan — Live GOLD scan\n"
-        "/status — System status\n"
+        "/scan — 15M GOLD scan\n"
+        "/scalp — Instant scalp scan\n"
+        "/scalpon — Enable scalp alerts\n"
+        "/scalpoff — Disable scalp alerts\n"
+        "/scalpstatus — Scalp status\n"
+        "/status — Full system status\n"
         "/start — Register Chat ID\n\n"
 
         "👑 *KING OF XAU_NAS IS READY.*"
@@ -408,14 +468,26 @@ async def status_command(
         else "🔴 MISSING"
     )
 
-    scanner_status = (
+    normal_status = (
         "🟢 ON"
         if scanner_running
         else "🔴 OFF"
     )
 
+    scalp_status = (
+        "🟢 ON"
+        if scalp_enabled
+        else "🔴 OFF"
+    )
+
+    scalp_scanner_status = (
+        "🟢 RUNNING"
+        if scalp_scanner_running
+        else "🔴 OFF"
+    )
+
     message = (
-        "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
+        "👑 *KING OF XAU_NAS AI* 👑\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚙️ *SYSTEM STATUS*\n"
@@ -423,18 +495,39 @@ async def status_command(
 
         f"Telegram: {telegram_status}\n"
         f"Twelve Data: {data_status}\n"
-        f"Scanner: {scanner_status}\n\n"
+        f"15M Scanner: {normal_status}\n"
+        f"Scalping Alerts: {scalp_status}\n"
+        f"Scalp Scanner: {scalp_scanner_status}\n\n"
 
-        "🟡 Market: XAU/USD\n"
-        "⏱ Timeframe: 15min\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟡 *NORMAL ENGINE*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "🧠 Confirmation Engine: ON\n"
-        "🚀 Breakout Detection: ON\n"
-        "🔄 Pullback Detection: ON\n"
-        "⚡ Reversal Detection: ON\n"
-        "🛡️ RSI Protection: ON\n"
-        "🛡️ ATR Protection: ON\n"
-        "🤖 Automatic Scanner: ON\n"
+        "Market: XAU/USD\n"
+        "Timeframe: 15min\n"
+        "EMA 20/50: ON\n"
+        "RSI 14: ON\n"
+        "ATR 14: ON\n"
+        "Breakout: ON\n"
+        "Pullback: ON\n"
+        "Reversal: ON\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ *SCALPING ENGINE*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Trend: 5min\n"
+        "Trigger: 1min\n"
+        "EMA: 9 / 21 / 50\n"
+        "RSI: 7\n"
+        "ATR: 14\n"
+        "Momentum Filter: ON\n"
+        "Extension Protection: ON\n"
+        "Confidence Filter: ON\n"
+        f"Minimum Confidence: "
+        f"{SCALP_MIN_CONFIDENCE}%\n"
+        f"Cooldown: "
+        f"{SCALP_COOLDOWN_SECONDS // 60} minutes\n"
     )
 
     if chat_id:
@@ -457,10 +550,13 @@ async def status_command(
 
 
 # ============================================================
-# TWELVE DATA
+# TWELVE DATA GENERIC
 # ============================================================
 
-def get_gold_data():
+def get_market_data(
+    interval,
+    output_size,
+):
 
     if not TWELVE_DATA_API_KEY:
 
@@ -477,8 +573,8 @@ def get_gold_data():
 
     params = {
         "symbol": XAU_SYMBOL,
-        "interval": INTERVAL,
-        "outputsize": OUTPUT_SIZE,
+        "interval": interval,
+        "outputsize": output_size,
         "apikey": TWELVE_DATA_API_KEY,
         "format": "JSON",
     }
@@ -495,7 +591,8 @@ def get_gold_data():
 
             logger.error(
                 f"Twelve Data HTTP "
-                f"{response.status_code}"
+                f"{response.status_code} "
+                f"for {interval}"
             )
 
             return None
@@ -505,7 +602,8 @@ def get_gold_data():
         if "values" not in data:
 
             logger.error(
-                f"Twelve Data error: {data}"
+                f"Twelve Data {interval} "
+                f"error: {data}"
             )
 
             return None
@@ -548,7 +646,7 @@ def get_gold_data():
         if len(candles) < 60:
 
             logger.error(
-                "Not enough GOLD candles."
+                f"Not enough {interval} candles."
             )
 
             return None
@@ -558,10 +656,35 @@ def get_gold_data():
     except Exception as e:
 
         logger.error(
-            f"Gold data error: {e}"
+            f"Market data error "
+            f"{interval}: {e}"
         )
 
         return None
+
+
+def get_gold_data():
+
+    return get_market_data(
+        NORMAL_INTERVAL,
+        NORMAL_OUTPUT_SIZE,
+    )
+
+
+def get_scalp_fast_data():
+
+    return get_market_data(
+        SCALP_FAST_INTERVAL,
+        SCALP_FAST_OUTPUT_SIZE,
+    )
+
+
+def get_scalp_trend_data():
+
+    return get_market_data(
+        SCALP_TREND_INTERVAL,
+        SCALP_TREND_OUTPUT_SIZE,
+    )
 
 
 # ============================================================
@@ -796,7 +919,7 @@ def get_momentum(candles):
 
 
 # ============================================================
-# CONFIRMATION ENGINE
+# NORMAL 15M CONFIRMATION ENGINE
 # ============================================================
 
 def analyze_gold(candles):
@@ -854,10 +977,6 @@ def analyze_gold(candles):
 
         return None
 
-    # ========================================================
-    # TREND
-    # ========================================================
-
     bullish_trend = (
         price > ema20
         and ema20 > ema50
@@ -880,10 +999,6 @@ def analyze_gold(candles):
 
         trend = "RANGING ↔️"
 
-    # ========================================================
-    # STRUCTURE
-    # ========================================================
-
     resistance = max(
         highs[-20:-1]
     )
@@ -904,19 +1019,11 @@ def analyze_gold(candles):
         and previous_close >= support
     )
 
-    # ========================================================
-    # ATR DISTANCE
-    # ========================================================
-
     atr_distance = (
         abs(price - ema20) / atr
         if atr > 0
         else 0
     )
-
-    # ========================================================
-    # PULLBACK ZONES
-    # ========================================================
 
     bullish_pullback_zone = (
         ema20 - atr * 0.75,
@@ -940,10 +1047,6 @@ def analyze_gold(candles):
         <= bearish_pullback_zone[1]
     )
 
-    # ========================================================
-    # RSI
-    # ========================================================
-
     bullish_rsi = (
         50 <= rsi <= 68
     )
@@ -959,10 +1062,6 @@ def analyze_gold(candles):
     extreme_oversold = (
         rsi <= 25
     )
-
-    # ========================================================
-    # REVERSAL
-    # ========================================================
 
     recent = candles[-3:]
 
@@ -992,10 +1091,6 @@ def analyze_gold(candles):
         and momentum == "BULLISH"
     )
 
-    # ========================================================
-    # SETUP TYPE
-    # ========================================================
-
     setup_type = "WAIT"
 
     if breakout_up:
@@ -1021,10 +1116,6 @@ def analyze_gold(candles):
     elif bearish_trend:
 
         setup_type = "BEARISH PULLBACK"
-
-    # ========================================================
-    # CONDITIONS
-    # ========================================================
 
     conditions = []
     failed = []
@@ -1113,10 +1204,6 @@ def analyze_gold(candles):
                 "Bearish momentum missing"
             )
 
-    # ========================================================
-    # BREAKOUT
-    # ========================================================
-
     if breakout_up:
 
         if bullish_trend:
@@ -1181,10 +1268,6 @@ def analyze_gold(candles):
                 "RSI too oversold"
             )
 
-    # ========================================================
-    # REVERSAL
-    # ========================================================
-
     if setup_type == "REVERSAL SELL":
 
         conditions = [
@@ -1200,10 +1283,6 @@ def analyze_gold(candles):
             "Bullish reversal candle",
             "Bullish momentum",
         ]
-
-    # ========================================================
-    # CONFIRMATION
-    # ========================================================
 
     confirmed = False
 
@@ -1249,10 +1328,6 @@ def analyze_gold(candles):
 
         confirmed = bullish_reversal
 
-    # ========================================================
-    # STAGE
-    # ========================================================
-
     if confirmed:
 
         stage = "CONFIRMED"
@@ -1268,10 +1343,6 @@ def analyze_gold(candles):
     else:
 
         stage = "WAIT"
-
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
 
     total_possible = max(
         len(conditions)
@@ -1290,10 +1361,6 @@ def analyze_gold(candles):
             confidence,
             80,
         )
-
-    # ========================================================
-    # DIRECTION
-    # ========================================================
 
     if setup_type in (
         "BREAKOUT BUY",
@@ -1314,10 +1381,6 @@ def analyze_gold(candles):
     else:
 
         direction = "WAIT"
-
-    # ========================================================
-    # EXTREME PROTECTION
-    # ========================================================
 
     if (
         bullish_trend
@@ -1347,61 +1410,27 @@ def analyze_gold(candles):
             "Extreme oversold condition"
         )
 
-    # ========================================================
-    # TRADE LEVELS
-    # ========================================================
-
     if direction == "BUY":
 
         entry = price
-
-        stop_loss = (
-            price - atr * 1.5
-        )
-
-        tp1 = (
-            price + atr
-        )
-
-        tp2 = (
-            price + atr * 2
-        )
-
-        tp3 = (
-            price + atr * 3
-        )
+        stop_loss = price - atr * 1.5
+        tp1 = price + atr
+        tp2 = price + atr * 2
+        tp3 = price + atr * 3
 
         pending_type = "BUY LIMIT"
-
-        pending_entry = (
-            price - atr * 0.50
-        )
+        pending_entry = price - atr * 0.50
 
     elif direction == "SELL":
 
         entry = price
-
-        stop_loss = (
-            price + atr * 1.5
-        )
-
-        tp1 = (
-            price - atr
-        )
-
-        tp2 = (
-            price - atr * 2
-        )
-
-        tp3 = (
-            price - atr * 3
-        )
+        stop_loss = price + atr * 1.5
+        tp1 = price - atr
+        tp2 = price - atr * 2
+        tp3 = price - atr * 3
 
         pending_type = "SELL LIMIT"
-
-        pending_entry = (
-            price + atr * 0.50
-        )
+        pending_entry = price + atr * 0.50
 
     else:
 
@@ -1463,7 +1492,7 @@ def analyze_gold(candles):
 
 
 # ============================================================
-# FORMAT SIGNAL
+# FORMAT NORMAL SIGNAL
 # ============================================================
 
 def format_signal(a):
@@ -1512,7 +1541,7 @@ def format_signal(a):
     message = (
         "👑 *KING OF XAU_NAS — GOLD* 👑\n\n"
 
-        "🟡 *XAU/USD*\n"
+        "🟡 *XAU/USD — NORMAL AI*\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
 
@@ -1545,10 +1574,6 @@ def format_signal(a):
         f"EMA Distance: "
         f"`{a['atr_distance']:.2f} ATR`\n\n"
     )
-
-    # ========================================================
-    # CONFIRMED TRADE
-    # ========================================================
 
     if a["confirmed"]:
 
@@ -1590,10 +1615,6 @@ def format_signal(a):
             f"`{a['pending_entry']:,.2f}`\n\n"
         )
 
-    # ========================================================
-    # FORMING
-    # ========================================================
-
     elif stage in (
         "NEAR CONFIRMATION",
         "SETUP FORMING",
@@ -1622,10 +1643,6 @@ def format_signal(a):
             "Wait for all required conditions.\n\n"
         )
 
-    # ========================================================
-    # WAIT
-    # ========================================================
-
     else:
 
         message += (
@@ -1644,10 +1661,6 @@ def format_signal(a):
                 f"`{a['pending_entry']:,.2f}`\n\n"
             )
 
-    # ========================================================
-    # PULLBACK ZONE
-    # ========================================================
-
     if a["trend"] == "BULLISH 📈":
 
         zone = a[
@@ -1656,7 +1669,6 @@ def format_signal(a):
 
         message += (
             "🔄 *BULLISH PULLBACK ZONE*\n"
-
             f"`{zone[0]:,.2f}` → "
             f"`{zone[1]:,.2f}`\n\n"
         )
@@ -1669,32 +1681,26 @@ def format_signal(a):
 
         message += (
             "🔄 *BEARISH PULLBACK ZONE*\n"
-
             f"`{zone[0]:,.2f}` → "
             f"`{zone[1]:,.2f}`\n\n"
         )
 
-    # ========================================================
-    # SYSTEM
-    # ========================================================
-
     message += (
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ *SYSTEM*\n"
+        "⚙️ *NORMAL SYSTEM*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
         "⏱ Timeframe: *15min*\n"
         "📡 Data: *Twelve Data*\n"
-        "🧠 Confirmation Engine: *ON*\n"
-        "🚀 Breakout Detection: *ON*\n"
-        "🔄 Pullback Detection: *ON*\n"
-        "⚡ Reversal Detection: *ON*\n"
+        "🧠 Confirmation: *ON*\n"
+        "🚀 Breakout: *ON*\n"
+        "🔄 Pullback: *ON*\n"
+        "⚡ Reversal: *ON*\n"
         "🛡️ RSI Protection: *ON*\n"
-        "🛡️ ATR Protection: *ON*\n"
-        "🤖 Automatic Scanner: *ON*\n\n"
+        "🛡️ ATR Protection: *ON*\n\n"
 
-        "⚠️ Market information is for analysis only.\n"
-        "Not financial advice. Manage risk carefully."
+        "⚠️ Analysis only. "
+        "Not financial advice."
     )
 
     return message
@@ -1707,7 +1713,7 @@ def format_signal(a):
 def scan_gold():
 
     logger.info(
-        "🔎 Scanning XAU/USD..."
+        "🔎 Scanning XAU/USD 15M..."
     )
 
     candles = get_gold_data()
@@ -1725,6 +1731,7 @@ def scan_gold():
         return None
 
     logger.info(
+        f"15M | "
         f"{analysis['stage']} | "
         f"{analysis['setup_type']} | "
         f"{analysis['direction']} | "
@@ -1745,7 +1752,7 @@ async def scan_command(
 ):
 
     await update.message.reply_text(
-        "🔎 *Scanning XAU/USD...*\n\n"
+        "🔎 *Scanning XAU/USD 15M...*\n\n"
         "Please wait...",
         parse_mode="Markdown",
     )
@@ -1762,7 +1769,6 @@ async def scan_command(
 
         return
 
-    # Register Chat ID when user uses /scan too
     if update.effective_chat:
 
         save_chat_id(
@@ -1776,7 +1782,1138 @@ async def scan_command(
 
 
 # ============================================================
-# AUTOMATIC SCANNER
+# ============================================================
+# ⚡ SCALPING ENGINE
+# ============================================================
+# ============================================================
+
+def get_scalp_trend(
+    candles
+):
+
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
+
+    ema20 = calculate_ema(
+        closes,
+        20,
+    )
+
+    ema50 = calculate_ema(
+        closes,
+        50,
+    )
+
+    if (
+        ema20 is None
+        or ema50 is None
+    ):
+
+        return "NEUTRAL"
+
+    price = closes[-1]
+
+    if (
+        price > ema20
+        and ema20 > ema50
+    ):
+
+        return "BULLISH"
+
+    if (
+        price < ema20
+        and ema20 < ema50
+    ):
+
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+def analyze_scalp(
+    fast_candles,
+    trend_candles,
+):
+
+    if (
+        not fast_candles
+        or not trend_candles
+    ):
+
+        return None
+
+    closes = [
+        candle["close"]
+        for candle in fast_candles
+    ]
+
+    highs = [
+        candle["high"]
+        for candle in fast_candles
+    ]
+
+    lows = [
+        candle["low"]
+        for candle in fast_candles
+    ]
+
+    price = closes[-1]
+
+    ema9 = calculate_ema(
+        closes,
+        9,
+    )
+
+    ema21 = calculate_ema(
+        closes,
+        21,
+    )
+
+    ema50 = calculate_ema(
+        closes,
+        50,
+    )
+
+    rsi = calculate_rsi(
+        closes,
+        7,
+    )
+
+    atr = calculate_atr(
+        fast_candles,
+        14,
+    )
+
+    trend_5m = get_scalp_trend(
+        trend_candles
+    )
+
+    momentum = get_momentum(
+        fast_candles
+    )
+
+    if any(
+        value is None
+        for value in (
+            ema9,
+            ema21,
+            ema50,
+            rsi,
+            atr,
+        )
+    ):
+
+        return None
+
+    if atr <= 0:
+
+        return None
+
+    # --------------------------------------------------------
+    # FAST TREND
+    # --------------------------------------------------------
+
+    fast_bullish = (
+        price > ema9
+        and ema9 > ema21
+        and ema21 > ema50
+    )
+
+    fast_bearish = (
+        price < ema9
+        and ema9 < ema21
+        and ema21 < ema50
+    )
+
+    # --------------------------------------------------------
+    # 5M + 1M ALIGNMENT
+    # --------------------------------------------------------
+
+    bullish_alignment = (
+        trend_5m == "BULLISH"
+        and fast_bullish
+    )
+
+    bearish_alignment = (
+        trend_5m == "BEARISH"
+        and fast_bearish
+    )
+
+    # --------------------------------------------------------
+    # RECENT STRUCTURE
+    # --------------------------------------------------------
+
+    lookback_high = max(
+        highs[-10:-1]
+    )
+
+    lookback_low = min(
+        lows[-10:-1]
+    )
+
+    previous_close = closes[-2]
+
+    breakout_buy = (
+        price > lookback_high
+        and previous_close <= lookback_high
+    )
+
+    breakout_sell = (
+        price < lookback_low
+        and previous_close >= lookback_low
+    )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    bullish_rsi = (
+        52 <= rsi <= 72
+    )
+
+    bearish_rsi = (
+        28 <= rsi <= 48
+    )
+
+    # Avoid chasing extreme RSI.
+    rsi_too_high = rsi >= 78
+    rsi_too_low = rsi <= 22
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    bullish_momentum = (
+        momentum == "BULLISH"
+    )
+
+    bearish_momentum = (
+        momentum == "BEARISH"
+    )
+
+    # --------------------------------------------------------
+    # EMA PULLBACK
+    # --------------------------------------------------------
+
+    bullish_pullback = (
+        ema21 - atr * 0.30
+        <= price
+        <= ema9 + atr * 0.25
+    )
+
+    bearish_pullback = (
+        ema9 - atr * 0.25
+        <= price
+        <= ema21 + atr * 0.30
+    )
+
+    # --------------------------------------------------------
+    # EXTENSION
+    # --------------------------------------------------------
+
+    extension = (
+        abs(price - ema21)
+        / atr
+    )
+
+    extended = (
+        extension
+        > SCALP_MAX_EXTENSION_ATR
+    )
+
+    # --------------------------------------------------------
+    # CANDLE DIRECTION
+    # --------------------------------------------------------
+
+    current = fast_candles[-1]
+    previous = fast_candles[-2]
+
+    bullish_candle = (
+        current["close"]
+        > current["open"]
+        and current["close"]
+        >= previous["close"]
+    )
+
+    bearish_candle = (
+        current["close"]
+        < current["open"]
+        and current["close"]
+        <= previous["close"]
+    )
+
+    # --------------------------------------------------------
+    # SCORE BUY
+    # --------------------------------------------------------
+
+    buy_score = 0
+    sell_score = 0
+
+    buy_conditions = []
+    sell_conditions = []
+
+    buy_failed = []
+    sell_failed = []
+
+    if trend_5m == "BULLISH":
+
+        buy_score += 20
+        buy_conditions.append(
+            "5M bullish trend"
+        )
+
+    else:
+
+        buy_failed.append(
+            "5M bullish trend missing"
+        )
+
+    if fast_bullish:
+
+        buy_score += 20
+        buy_conditions.append(
+            "1M EMA 9/21/50 bullish"
+        )
+
+    else:
+
+        buy_failed.append(
+            "1M EMA alignment missing"
+        )
+
+    if bullish_momentum:
+
+        buy_score += 15
+        buy_conditions.append(
+            "Bullish candle momentum"
+        )
+
+    else:
+
+        buy_failed.append(
+            "Bullish momentum missing"
+        )
+
+    if bullish_rsi:
+
+        buy_score += 15
+        buy_conditions.append(
+            "RSI bullish zone"
+        )
+
+    else:
+
+        buy_failed.append(
+            "RSI not in bullish zone"
+        )
+
+    if (
+        bullish_pullback
+        or breakout_buy
+    ):
+
+        buy_score += 15
+
+        if breakout_buy:
+
+            buy_conditions.append(
+                "1M structure breakout"
+            )
+
+        else:
+
+            buy_conditions.append(
+                "EMA pullback zone"
+            )
+
+    else:
+
+        buy_failed.append(
+            "No pullback/breakout trigger"
+        )
+
+    if bullish_candle:
+
+        buy_score += 10
+        buy_conditions.append(
+            "Bullish trigger candle"
+        )
+
+    else:
+
+        buy_failed.append(
+            "Bullish trigger candle missing"
+        )
+
+    if not rsi_too_high:
+
+        buy_score += 5
+
+    else:
+
+        buy_failed.append(
+            "RSI excessively overbought"
+        )
+
+    # --------------------------------------------------------
+    # SCORE SELL
+    # --------------------------------------------------------
+
+    if trend_5m == "BEARISH":
+
+        sell_score += 20
+        sell_conditions.append(
+            "5M bearish trend"
+        )
+
+    else:
+
+        sell_failed.append(
+            "5M bearish trend missing"
+        )
+
+    if fast_bearish:
+
+        sell_score += 20
+        sell_conditions.append(
+            "1M EMA 9/21/50 bearish"
+        )
+
+    else:
+
+        sell_failed.append(
+            "1M EMA alignment missing"
+        )
+
+    if bearish_momentum:
+
+        sell_score += 15
+        sell_conditions.append(
+            "Bearish candle momentum"
+        )
+
+    else:
+
+        sell_failed.append(
+            "Bearish momentum missing"
+        )
+
+    if bearish_rsi:
+
+        sell_score += 15
+        sell_conditions.append(
+            "RSI bearish zone"
+        )
+
+    else:
+
+        sell_failed.append(
+            "RSI not in bearish zone"
+        )
+
+    if (
+        bearish_pullback
+        or breakout_sell
+    ):
+
+        sell_score += 15
+
+        if breakout_sell:
+
+            sell_conditions.append(
+                "1M structure breakdown"
+            )
+
+        else:
+
+            sell_conditions.append(
+                "EMA pullback zone"
+            )
+
+    else:
+
+        sell_failed.append(
+            "No pullback/breakdown trigger"
+        )
+
+    if bearish_candle:
+
+        sell_score += 10
+        sell_conditions.append(
+            "Bearish trigger candle"
+        )
+
+    else:
+
+        sell_failed.append(
+            "Bearish trigger candle missing"
+        )
+
+    if not rsi_too_low:
+
+        sell_score += 5
+
+    else:
+
+        sell_failed.append(
+            "RSI excessively oversold"
+        )
+
+    # --------------------------------------------------------
+    # DETERMINE DIRECTION
+    # --------------------------------------------------------
+
+    direction = "WAIT"
+    score = max(
+        buy_score,
+        sell_score,
+    )
+
+    conditions = []
+    failed = []
+
+    if (
+        buy_score > sell_score
+        and bullish_alignment
+        and not rsi_too_high
+        and not extended
+    ):
+
+        direction = "BUY"
+        conditions = buy_conditions
+        failed = buy_failed
+
+    elif (
+        sell_score > buy_score
+        and bearish_alignment
+        and not rsi_too_low
+        and not extended
+    ):
+
+        direction = "SELL"
+        conditions = sell_conditions
+        failed = sell_failed
+
+    else:
+
+        if buy_score >= sell_score:
+
+            conditions = buy_conditions
+            failed = buy_failed
+
+        else:
+
+            conditions = sell_conditions
+            failed = sell_failed
+
+    # --------------------------------------------------------
+    # SETUP TYPE
+    # --------------------------------------------------------
+
+    if direction == "BUY":
+
+        if breakout_buy:
+
+            setup_type = "SCALP BREAKOUT BUY"
+
+        elif bullish_pullback:
+
+            setup_type = "SCALP PULLBACK BUY"
+
+        else:
+
+            setup_type = "SCALP MOMENTUM BUY"
+
+    elif direction == "SELL":
+
+        if breakout_sell:
+
+            setup_type = "SCALP BREAKDOWN SELL"
+
+        elif bearish_pullback:
+
+            setup_type = "SCALP PULLBACK SELL"
+
+        else:
+
+            setup_type = "SCALP MOMENTUM SELL"
+
+    else:
+
+        if (
+            buy_score
+            >= sell_score
+        ):
+
+            setup_type = (
+                "SCALP BUY WATCH"
+            )
+
+        else:
+
+            setup_type = (
+                "SCALP SELL WATCH"
+            )
+
+    # --------------------------------------------------------
+    # EXTENSION PROTECTION
+    # --------------------------------------------------------
+
+    if extended:
+
+        direction = "WAIT"
+
+        failed.append(
+            "Price too extended from EMA21"
+        )
+
+    # --------------------------------------------------------
+    # CONFIRMATION
+    # --------------------------------------------------------
+
+    confirmed = (
+        direction in (
+            "BUY",
+            "SELL",
+        )
+        and score
+        >= SCALP_MIN_CONFIDENCE
+        and not extended
+    )
+
+    # Need actual trigger confirmation.
+    if confirmed:
+
+        if direction == "BUY":
+
+            confirmed = (
+                bullish_alignment
+                and bullish_momentum
+                and bullish_rsi
+                and (
+                    bullish_pullback
+                    or breakout_buy
+                )
+                and bullish_candle
+                and not rsi_too_high
+            )
+
+        elif direction == "SELL":
+
+            confirmed = (
+                bearish_alignment
+                and bearish_momentum
+                and bearish_rsi
+                and (
+                    bearish_pullback
+                    or breakout_sell
+                )
+                and bearish_candle
+                and not rsi_too_low
+            )
+
+    # --------------------------------------------------------
+    # STAGE
+    # --------------------------------------------------------
+
+    if confirmed:
+
+        stage = "SCALP CONFIRMED"
+
+    elif score >= 70:
+
+        stage = "SCALP NEAR CONFIRMATION"
+
+    elif score >= 50:
+
+        stage = "SCALP SETUP FORMING"
+
+    else:
+
+        stage = "SCALP WAIT"
+
+    # --------------------------------------------------------
+    # TRADE LEVELS
+    # --------------------------------------------------------
+
+    if confirmed:
+
+        entry = price
+
+        if direction == "BUY":
+
+            stop_loss = (
+                price
+                - atr
+                * SCALP_SL_ATR_MULTIPLIER
+            )
+
+            tp1 = (
+                price
+                + atr
+                * SCALP_TP1_ATR_MULTIPLIER
+            )
+
+            tp2 = (
+                price
+                + atr
+                * SCALP_TP2_ATR_MULTIPLIER
+            )
+
+            tp3 = (
+                price
+                + atr
+                * SCALP_TP3_ATR_MULTIPLIER
+            )
+
+        else:
+
+            stop_loss = (
+                price
+                + atr
+                * SCALP_SL_ATR_MULTIPLIER
+            )
+
+            tp1 = (
+                price
+                - atr
+                * SCALP_TP1_ATR_MULTIPLIER
+            )
+
+            tp2 = (
+                price
+                - atr
+                * SCALP_TP2_ATR_MULTIPLIER
+            )
+
+            tp3 = (
+                price
+                - atr
+                * SCALP_TP3_ATR_MULTIPLIER
+            )
+
+    else:
+
+        entry = price
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+        tp3 = None
+
+    return {
+        "price": price,
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema50": ema50,
+        "rsi": rsi,
+        "atr": atr,
+        "trend_5m": trend_5m,
+        "momentum": momentum,
+        "extension": extension,
+        "setup_type": setup_type,
+        "direction": direction,
+        "score": score,
+        "confidence": score,
+        "stage": stage,
+        "confirmed": confirmed,
+        "conditions": conditions,
+        "failed": failed,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "breakout_buy": breakout_buy,
+        "breakout_sell": breakout_sell,
+        "bullish_pullback": bullish_pullback,
+        "bearish_pullback": bearish_pullback,
+        "extended": extended,
+    }
+
+
+# ============================================================
+# FORMAT SCALP SIGNAL
+# ============================================================
+
+def format_scalp_signal(a):
+
+    if a["confirmed"]:
+
+        if a["direction"] == "BUY":
+
+            header = (
+                "🚨 *SCALP BUY CONFIRMED* 🚨"
+            )
+
+        else:
+
+            header = (
+                "🚨 *SCALP SELL CONFIRMED* 🚨"
+            )
+
+    elif a["stage"] == "SCALP NEAR CONFIRMATION":
+
+        header = (
+            "🟠 *SCALP NEAR CONFIRMATION* 🟠"
+        )
+
+    elif a["stage"] == "SCALP SETUP FORMING":
+
+        header = (
+            "🟡 *SCALP SETUP FORMING* 🟡"
+        )
+
+    else:
+
+        header = (
+            "⚪ *SCALP WAIT* ⚪"
+        )
+
+    message = (
+        "👑 *KING OF XAU_NAS AI* 👑\n\n"
+
+        "⚡ *SCALPING ENGINE*\n"
+        "🟡 *XAU/USD*\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+
+        f"{header}\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"📌 Setup: *{a['setup_type']}*\n"
+        f"📊 Direction: *{a['direction']}*\n"
+        f"🎯 Stage: *{a['stage']}*\n"
+        f"💯 Confidence: "
+        f"*{a['confidence']:.0f}%*\n\n"
+
+        f"💰 Price: "
+        f"`${a['price']:,.2f}`\n"
+
+        f"📈 5M Trend: "
+        f"*{a['trend_5m']}*\n"
+
+        f"⚡ 1M Momentum: "
+        f"*{a['momentum']}*\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 *SCALP INDICATORS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"EMA 9: `{a['ema9']:,.2f}`\n"
+        f"EMA 21: `{a['ema21']:,.2f}`\n"
+        f"EMA 50: `{a['ema50']:,.2f}`\n"
+        f"RSI 7: `{a['rsi']:.1f}`\n"
+        f"ATR 14: `{a['atr']:.2f}`\n"
+        f"Extension: "
+        f"`{a['extension']:.2f} ATR`\n\n"
+    )
+
+    if a["confirmed"]:
+
+        message += (
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🚨 *SCALP TRADE LEVELS*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"🎯 Entry: "
+            f"`${a['entry']:,.2f}`\n"
+
+            f"🛑 SL: "
+            f"`${a['stop_loss']:,.2f}`\n"
+
+            f"🥇 TP1: "
+            f"`${a['tp1']:,.2f}`\n"
+
+            f"🥈 TP2: "
+            f"`${a['tp2']:,.2f}`\n"
+
+            f"🏆 TP3: "
+            f"`${a['tp3']:,.2f}`\n\n"
+
+            "💡 *Scalp management idea:*\n"
+            "Consider protecting the position "
+            "after TP1 rather than holding "
+            "blindly for TP3.\n\n"
+        )
+
+    else:
+
+        message += (
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🧠 *SCALP CONFIRMATION*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
+        for condition in a["conditions"]:
+
+            message += (
+                f"✅ {condition}\n"
+            )
+
+        for failed in a["failed"]:
+
+            message += (
+                f"⏳ {failed}\n"
+            )
+
+        message += (
+            "\n⚠️ *No confirmed scalp yet.*\n"
+            "Wait for the trigger.\n\n"
+        )
+
+    message += (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⚙️ *SCALPING SETTINGS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Trend TF: *5min*\n"
+        "Trigger TF: *1min*\n"
+        "EMA: *9 / 21 / 50*\n"
+        "RSI: *7*\n"
+        "ATR: *14*\n"
+
+        f"Min Confidence: "
+        f"*{SCALP_MIN_CONFIDENCE}%*\n"
+
+        f"Cooldown: "
+        f"*{SCALP_COOLDOWN_SECONDS // 60} min*\n\n"
+
+        "⚠️ Scalping is high risk.\n"
+        "Analysis only — not financial advice."
+    )
+
+    return message
+
+
+# ============================================================
+# SCAN SCALP
+# ============================================================
+
+def scan_scalp():
+
+    logger.info(
+        "⚡ Scanning XAU/USD 1M + 5M..."
+    )
+
+    fast_candles = get_scalp_fast_data()
+
+    if not fast_candles:
+
+        return None
+
+    trend_candles = get_scalp_trend_data()
+
+    if not trend_candles:
+
+        return None
+
+    analysis = analyze_scalp(
+        fast_candles,
+        trend_candles,
+    )
+
+    if not analysis:
+
+        return None
+
+    logger.info(
+        f"SCALP | "
+        f"{analysis['stage']} | "
+        f"{analysis['setup_type']} | "
+        f"{analysis['direction']} | "
+        f"Score={analysis['confidence']:.0f}% | "
+        f"Price={analysis['price']:.2f}"
+    )
+
+    return analysis
+
+
+# ============================================================
+# /SCALP
+# ============================================================
+
+async def scalp_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if update.effective_chat:
+
+        save_chat_id(
+            update.effective_chat.id
+        )
+
+    await update.message.reply_text(
+        "⚡ *SCALP ENGINE ACTIVATED*\n\n"
+        "Analysing XAU/USD...\n"
+        "5M trend + 1M trigger\n\n"
+        "Please wait...",
+        parse_mode="Markdown",
+    )
+
+    analysis = await asyncio.to_thread(
+        scan_scalp
+    )
+
+    if not analysis:
+
+        await update.message.reply_text(
+            "❌ Unable to retrieve "
+            "scalping market data."
+        )
+
+        return
+
+    await update.message.reply_text(
+        format_scalp_signal(
+            analysis
+        ),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# /SCALPON
+# ============================================================
+
+async def scalpon_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global scalp_enabled
+
+    if update.effective_chat:
+
+        save_chat_id(
+            update.effective_chat.id
+        )
+
+    scalp_enabled = True
+
+    await update.message.reply_text(
+        "⚡ *SCALPING MODE: ON* ⚡\n\n"
+
+        "🟢 Automatic scalp scanning enabled.\n\n"
+
+        "5M = trend confirmation\n"
+        "1M = scalp trigger\n\n"
+
+        f"Minimum confidence: "
+        f"*{SCALP_MIN_CONFIDENCE}%*\n"
+
+        f"Cooldown: "
+        f"*{SCALP_COOLDOWN_SECONDS // 60} minutes*\n\n"
+
+        "👑 KING OF XAU_NAS is watching.",
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# /SCALPOFF
+# ============================================================
+
+async def scalpoff_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global scalp_enabled
+
+    if update.effective_chat:
+
+        save_chat_id(
+            update.effective_chat.id
+        )
+
+    scalp_enabled = False
+
+    await update.message.reply_text(
+        "🛑 *SCALPING MODE: OFF*\n\n"
+        "Automatic scalp alerts are disabled.\n\n"
+        "Your normal 15M AI scanner remains active.",
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# /SCALPSTATUS
+# ============================================================
+
+async def scalpstatus_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    enabled = (
+        "🟢 ON"
+        if scalp_enabled
+        else "🔴 OFF"
+    )
+
+    running = (
+        "🟢 RUNNING"
+        if scalp_scanner_running
+        else "🔴 OFF"
+    )
+
+    message = (
+        "👑 *KING OF XAU_NAS AI*\n\n"
+
+        "⚡ *SCALPING ENGINE STATUS*\n\n"
+
+        f"Automatic Scalp Alerts: {enabled}\n"
+        f"Scanner: {running}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 *ENGINE*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Market: XAU/USD\n"
+        "Trend TF: 5min\n"
+        "Trigger TF: 1min\n"
+        "EMA: 9 / 21 / 50\n"
+        "RSI: 7\n"
+        "ATR: 14\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🛡️ *PROTECTION*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"Minimum Confidence: "
+        f"{SCALP_MIN_CONFIDENCE}%\n"
+
+        f"SL ATR: "
+        f"{SCALP_SL_ATR_MULTIPLIER}\n"
+
+        f"TP1 ATR: "
+        f"{SCALP_TP1_ATR_MULTIPLIER}\n"
+
+        f"TP2 ATR: "
+        f"{SCALP_TP2_ATR_MULTIPLIER}\n"
+
+        f"TP3 ATR: "
+        f"{SCALP_TP3_ATR_MULTIPLIER}\n"
+
+        f"Cooldown: "
+        f"{SCALP_COOLDOWN_SECONDS // 60} min\n\n"
+
+        "Use /scalpon or /scalpoff "
+        "to control automatic alerts."
+    )
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# NORMAL AUTOMATIC SCANNER
 # ============================================================
 
 async def automatic_scanner(
@@ -1792,7 +2929,7 @@ async def automatic_scanner(
     scanner_running = True
 
     logger.info(
-        "🟢 Advanced automatic scanner started."
+        "🟢 15M automatic scanner started."
     )
 
     try:
@@ -1833,10 +2970,6 @@ async def automatic_scanner(
                         f"{direction}_"
                         f"{price_zone}"
                     )
-
-                    # ==================================================
-                    # CONFIRMED SIGNAL
-                    # ==================================================
 
                     if (
                         analysis["confirmed"]
@@ -1882,13 +3015,9 @@ async def automatic_scanner(
                                 )
 
                                 logger.info(
-                                    "🚨 CONFIRMED "
+                                    "🚨 15M CONFIRMED "
                                     "SIGNAL SENT."
                                 )
-
-                    # ==================================================
-                    # FORMING SETUP
-                    # ==================================================
 
                     elif stage in (
                         "SETUP FORMING",
@@ -1923,7 +3052,7 @@ async def automatic_scanner(
                                 )
 
                                 logger.info(
-                                    f"🟠 {stage} "
+                                    f"🟠 15M {stage} "
                                     "notification sent."
                                 )
 
@@ -1931,7 +3060,6 @@ async def automatic_scanner(
 
                         last_setup_stage = stage
 
-                # Wait until next scan
                 await asyncio.sleep(
                     SCAN_INTERVAL_SECONDS
                 )
@@ -1939,8 +3067,7 @@ async def automatic_scanner(
             except asyncio.CancelledError:
 
                 logger.info(
-                    "🛑 Automatic scanner "
-                    "cancelled."
+                    "🛑 15M scanner cancelled."
                 )
 
                 raise
@@ -1948,7 +3075,7 @@ async def automatic_scanner(
             except Exception as e:
 
                 logger.exception(
-                    f"Automatic scanner error: {e}"
+                    f"15M scanner error: {e}"
                 )
 
                 await asyncio.sleep(
@@ -1960,7 +3087,227 @@ async def automatic_scanner(
         scanner_running = False
 
         logger.info(
-            "🔴 Automatic scanner stopped."
+            "🔴 15M scanner stopped."
+        )
+
+
+# ============================================================
+# ⚡ AUTOMATIC SCALPING SCANNER
+# ============================================================
+
+async def automatic_scalp_scanner(
+    application: Application,
+):
+
+    global scalp_scanner_running
+    global last_scalp_key
+    global last_scalp_time
+    global last_scalp_stage
+
+    scalp_scanner_running = True
+
+    logger.info(
+        "⚡ Scalping automatic scanner started."
+    )
+
+    try:
+
+        while True:
+
+            try:
+
+                # --------------------------------------------
+                # If user disabled scalping, stay alive but
+                # do not consume market API unnecessarily.
+                # --------------------------------------------
+
+                if not scalp_enabled:
+
+                    await asyncio.sleep(
+                        10
+                    )
+
+                    continue
+
+                analysis = await asyncio.to_thread(
+                    scan_scalp
+                )
+
+                if analysis:
+
+                    stage = analysis[
+                        "stage"
+                    ]
+
+                    direction = analysis[
+                        "direction"
+                    ]
+
+                    setup = analysis[
+                        "setup_type"
+                    ]
+
+                    price = analysis[
+                        "price"
+                    ]
+
+                    confidence = analysis[
+                        "confidence"
+                    ]
+
+                    # ----------------------------------------
+                    # CONFIRMED SCALP
+                    # ----------------------------------------
+
+                    if (
+                        analysis["confirmed"]
+                        and direction in (
+                            "BUY",
+                            "SELL",
+                        )
+                        and confidence
+                        >= SCALP_MIN_CONFIDENCE
+                    ):
+
+                        scalp_key = (
+                            f"{setup}_"
+                            f"{direction}_"
+                            f"{round(price, 1)}"
+                        )
+
+                        now = time.time()
+
+                        cooldown_passed = (
+                            now
+                            - last_scalp_time
+                            >= SCALP_COOLDOWN_SECONDS
+                        )
+
+                        new_signal = (
+                            scalp_key
+                            != last_scalp_key
+                        )
+
+                        if (
+                            cooldown_passed
+                            and new_signal
+                        ):
+
+                            message = (
+                                format_scalp_signal(
+                                    analysis
+                                )
+                            )
+
+                            sent = await send_message(
+                                message,
+                                application,
+                            )
+
+                            if sent:
+
+                                last_scalp_key = (
+                                    scalp_key
+                                )
+
+                                last_scalp_time = (
+                                    now
+                                )
+
+                                last_scalp_stage = (
+                                    stage
+                                )
+
+                                logger.info(
+                                    "🚨 SCALP "
+                                    "SIGNAL SENT."
+                                )
+
+                    # ----------------------------------------
+                    # NEAR CONFIRMATION
+                    # ----------------------------------------
+
+                    elif stage == (
+                        "SCALP NEAR CONFIRMATION"
+                    ):
+
+                        scalp_key = (
+                            f"{setup}_"
+                            f"{direction}_"
+                            f"{round(price, 1)}"
+                        )
+
+                        # Do not spam near-confirmation
+                        # messages. Only notify on a new
+                        # setup/stage combination.
+
+                        if (
+                            scalp_key
+                            != last_scalp_key
+                            or
+                            stage
+                            != last_scalp_stage
+                        ):
+
+                            # Only notify if reasonably strong.
+                            if confidence >= 70:
+
+                                message = (
+                                    format_scalp_signal(
+                                        analysis
+                                    )
+                                )
+
+                                sent = (
+                                    await send_message(
+                                        message,
+                                        application,
+                                    )
+                                )
+
+                                if sent:
+
+                                    last_scalp_key = (
+                                        scalp_key
+                                    )
+
+                                    last_scalp_stage = (
+                                        stage
+                                    )
+
+                                    logger.info(
+                                        "🟠 SCALP NEAR "
+                                        "CONFIRMATION SENT."
+                                    )
+
+                await asyncio.sleep(
+                    SCALP_SCAN_INTERVAL_SECONDS
+                )
+
+            except asyncio.CancelledError:
+
+                logger.info(
+                    "🛑 Scalping scanner cancelled."
+                )
+
+                raise
+
+            except Exception as e:
+
+                logger.exception(
+                    f"Scalping scanner error: {e}"
+                )
+
+                await asyncio.sleep(
+                    15
+                )
+
+    finally:
+
+        scalp_scanner_running = False
+
+        logger.info(
+            "🔴 Scalping scanner stopped."
         )
 
 
@@ -1988,17 +3335,30 @@ async def post_init(
             "Send /start in Telegram."
         )
 
-    # Start automatic scanner INSIDE
-    # Telegram's event loop.
+    # --------------------------------------------------------
+    # NORMAL 15M ENGINE
+    # --------------------------------------------------------
+
     application.create_task(
         automatic_scanner(
             application
         ),
-        name="gold_automatic_scanner",
+        name="gold_15m_scanner",
+    )
+
+    # --------------------------------------------------------
+    # SCALPING ENGINE
+    # --------------------------------------------------------
+
+    application.create_task(
+        automatic_scalp_scanner(
+            application
+        ),
+        name="gold_scalping_scanner",
     )
 
     logger.info(
-        "🟢 Automatic scanner task created."
+        "🟢 Both scanner tasks created."
     )
 
 
@@ -2010,13 +3370,15 @@ async def post_shutdown(
     application: Application,
 ):
 
+    global scanner_running
+    global scalp_scanner_running
+
     logger.info(
         "🛑 Telegram application shutting down."
     )
 
-    global scanner_running
-
     scanner_running = False
+    scalp_scanner_running = False
 
     logger.info(
         "🛑 KING OF XAU_NAS shutdown complete."
@@ -2049,6 +3411,7 @@ def create_application():
         .build()
     )
 
+    # Normal commands
     application.add_handler(
         CommandHandler(
             "start",
@@ -2070,6 +3433,35 @@ def create_application():
         )
     )
 
+    # Scalping commands
+    application.add_handler(
+        CommandHandler(
+            "scalp",
+            scalp_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scalpon",
+            scalpon_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scalpoff",
+            scalpoff_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scalpstatus",
+            scalpstatus_command,
+        )
+    )
+
     return application
 
 
@@ -2084,7 +3476,7 @@ def main():
     )
 
     logger.info(
-        "👑 KING OF XAU_NAS — GOLD"
+        "👑 KING OF XAU_NAS AI"
     )
 
     logger.info(
@@ -2096,7 +3488,18 @@ def main():
     )
 
     logger.info(
-        f"Timeframe: {INTERVAL}"
+        f"Normal timeframe: "
+        f"{NORMAL_INTERVAL}"
+    )
+
+    logger.info(
+        f"Scalp trend timeframe: "
+        f"{SCALP_TREND_INTERVAL}"
+    )
+
+    logger.info(
+        f"Scalp trigger timeframe: "
+        f"{SCALP_FAST_INTERVAL}"
     )
 
     logger.info(
@@ -2113,6 +3516,10 @@ def main():
 
     logger.info(
         "🧠 Confirmation engine: ON"
+    )
+
+    logger.info(
+        "⚡ Scalping engine: ON"
     )
 
     logger.info(
@@ -2145,9 +3552,7 @@ def main():
 
     try:
 
-        flask_thread = __import__(
-            "threading"
-        ).Thread(
+        flask_thread = threading.Thread(
             target=run_flask,
             daemon=True,
             name="flask_server",
@@ -2172,7 +3577,17 @@ def main():
     # TELEGRAM
     # ========================================================
 
-    application = create_application()
+    try:
+
+        application = create_application()
+
+    except Exception as e:
+
+        logger.exception(
+            f"Telegram application error: {e}"
+        )
+
+        return
 
     logger.info(
         "🟢 Telegram application created."
@@ -2187,7 +3602,7 @@ def main():
     )
 
     logger.info(
-        "👑 KING OF XAU_NAS ONLINE"
+        "👑 KING OF XAU_NAS AI ONLINE"
     )
 
     logger.info(
@@ -2199,11 +3614,15 @@ def main():
     )
 
     logger.info(
-        "🧠 Confirmation engine: ONLINE"
+        "🧠 15M Confirmation: ONLINE"
     )
 
     logger.info(
-        "🤖 Automatic scanner: ONLINE"
+        "⚡ 1M/5M Scalping: ONLINE"
+    )
+
+    logger.info(
+        "🤖 Automatic scanners: ONLINE"
     )
 
     logger.info(
