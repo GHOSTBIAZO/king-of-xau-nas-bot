@@ -1,0 +1,30 @@
+# KING OF XAU/NAS — Signal Terminal
+
+## Render Environment Variables
+
+Required:
+- TELEGRAM_BOT_TOKEN
+- TWELVE_DATA_API_KEY
+
+Recommended:
+- TELEGRAM_CHAT_ID
+
+Optional:
+- XAU_SYMBOL=XAU/USD
+- NAS_SYMBOL=NDX
+- ENTRY_INTERVAL=5min
+- MAIN_INTERVAL=15min
+- HTF_INTERVAL=1h
+- SCAN_SECONDS=60
+- MIN_CONFIDENCE=82
+- SIGNAL_COOLDOWN_SECONDS=1800
+
+## Important
+
+This bot sends only qualifying signals. It does not send WAIT messages.
+
+If Twelve Data uses a different NAS100 symbol for your plan, change `NAS_SYMBOL` in Render without changing the code.
+
+The `/health` command lets you diagnose the scanner from Telegram.
+
+For true 24/7 operation on Render, use an always-on service/plan or an appropriate external uptime strategy. A free service may sleep depending on Render's current service rules.
