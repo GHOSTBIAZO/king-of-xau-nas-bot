@@ -1,801 +1,1394 @@
 import os
 import time
-import math
-import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
 
 import requests
+import pandas as pd
+import numpy as np
+
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler,
 )
 
 # ============================================================
-# KING OF XAU/NAS — SIGNAL TERMINAL
-# Straight Entry + Slingshot + Scalp + Health Watchdog
-# Designed for Render + Telegram + Twelve Data
+# KING OF XAU/NAS
+# GOLD + NAS100 SIGNAL SCANNER
 # ============================================================
+
+BOT_NAME = "👑 KING OF XAU/NAS"
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
+PORT = int(os.getenv("PORT", "10000"))
+
+# ------------------------------------------------------------
+# MARKET SETTINGS
+# ------------------------------------------------------------
+
+MAIN_INTERVAL = "15min"
+HTF_INTERVAL = "1h"
+ENTRY_INTERVAL = "5min"
+
+OUTPUT_SIZE = 100
+
+SCAN_INTERVAL_SECONDS = 300
+REQUEST_TIMEOUT = 20
+
+MIN_CONFIDENCE = 82
+
+# ------------------------------------------------------------
+# SYMBOLS
+# ------------------------------------------------------------
+
+XAU_SYMBOLS = [
+    "XAU/USD",
+    "XAUUSD",
+]
+
+# Twelve Data symbol support can differ by plan.
+# Try several possibilities automatically.
+NAS_SYMBOLS = [
+    "NDX",
+    "NASDAQ",
+    "NASDAQ:NDX",
+    "US100",
+    "NAS100",
+    "NQ",
+]
+
+# ------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("KING")
 
-# ---------------- ENVIRONMENT ----------------
+logger = logging.getLogger("KING_XAU_NAS")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
-
-PORT = int(os.getenv("PORT", "10000"))
-
-# Twelve Data symbols can differ by plan/data package.
-# Override these in Render Environment Variables if necessary.
-XAU_SYMBOL = os.getenv("XAU_SYMBOL", "XAU/USD").strip()
-NAS_SYMBOL = os.getenv("NAS_SYMBOL", "NDX").strip()
-
-# Timeframes
-ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "5min")
-MAIN_INTERVAL = os.getenv("MAIN_INTERVAL", "15min")
-HTF_INTERVAL = os.getenv("HTF_INTERVAL", "1h")
-
-# Scanner timing
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
-
-# Signal thresholds
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "82"))
-STRAIGHT_MIN_SCORE = float(os.getenv("STRAIGHT_MIN_SCORE", "8"))
-SLINGSHOT_MIN_SCORE = float(os.getenv("SLINGSHOT_MIN_SCORE", "8"))
-SCALP_MIN_SCORE = float(os.getenv("SCALP_MIN_SCORE", "8"))
-
-# Don't repeatedly send the same setup
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))
-
-# ---------------- STATE ----------------
+# ------------------------------------------------------------
+# FLASK / RENDER HEALTH SERVER
+# ------------------------------------------------------------
 
 app = Flask(__name__)
 
-state = {
-    "started_at": time.time(),
-    "last_scan": None,
-    "last_success": None,
-    "last_signal": None,
-    "last_signal_time": None,
-    "scanner_running": False,
-    "scanner_errors": 0,
-    "api_ok": False,
-    "telegram_ok": False,
-    "xau_ok": False,
-    "nas_ok": False,
-    "last_error": "",
+bot_started_at = datetime.now(timezone.utc)
+
+last_scan_time = None
+
+market_status = {
+    "XAUUSD": {
+        "status": "STARTING",
+        "symbol": None,
+        "price": None,
+        "last_update": None,
+        "error": None,
+    },
+    "NAS100": {
+        "status": "STARTING",
+        "symbol": None,
+        "price": None,
+        "last_update": None,
+        "error": None,
+    },
 }
 
-cache = {}
-signal_memory = {}
+cached_data = {}
 
-# ---------------- WEB HEALTH ----------------
+last_signals = {}
 
-@app.get("/")
+# Prevent multiple scanners from running.
+scanner_lock = threading.Lock()
+
+
+@app.route("/")
 def home():
     return jsonify({
-        "service": "KING OF XAU/NAS SIGNAL TERMINAL",
-        "status": "online",
-        "scanner_running": state["scanner_running"],
-        "last_scan": state["last_scan"],
+        "bot": BOT_NAME,
+        "status": "RUNNING",
+        "scanner": "RUNNING",
+        "started_at": bot_started_at.isoformat(),
+        "last_scan": last_scan_time,
+        "markets": market_status,
     })
 
-@app.get("/health")
+
+@app.route("/health")
 def health():
     return jsonify({
-        "status": "healthy" if state["scanner_running"] else "degraded",
-        "scanner_running": state["scanner_running"],
-        "api_ok": state["api_ok"],
-        "telegram_ok": state["telegram_ok"],
-        "xau_ok": state["xau_ok"],
-        "nas_ok": state["nas_ok"],
-        "last_scan": state["last_scan"],
-        "last_success": state["last_success"],
-        "last_error": state["last_error"],
-        "uptime_seconds": int(time.time() - state["started_at"]),
+        "status": "ok",
+        "scanner": "running",
+        "markets": market_status,
     })
 
-def run_web():
-    # 0.0.0.0 is required by Render.
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# ---------------- UTILITIES ----------------
+def run_flask():
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        threaded=True,
+    )
 
-def utc_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def safe_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return None
+# ============================================================
+# TWELVE DATA
+# ============================================================
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def twelve_data_request(params):
+    """
+    Rate-limit-safe Twelve Data request.
+    """
 
-def mean(values):
-    values = [v for v in values if v is not None]
-    return sum(values) / len(values) if values else 0.0
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-    alpha = 2 / (period + 1)
-    result = values[0]
-    for v in values[1:]:
-        result = alpha * v + (1 - alpha) * result
-    return result
-
-def ema_series(values, period):
-    if not values:
-        return []
-    alpha = 2 / (period + 1)
-    result = [values[0]]
-    for v in values[1:]:
-        result.append(alpha * v + (1 - alpha) * result[-1])
-    return result
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = mean(gains[:period])
-    avg_loss = mean(losses[:period])
-
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-
-    trs = []
-    for i in range(1, len(candles)):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
-
-    return mean(trs[-period:])
-
-def candle_stats(c):
-    rng = max(c["high"] - c["low"], 1e-9)
-    body = abs(c["close"] - c["open"])
-    upper = c["high"] - max(c["open"], c["close"])
-    lower = min(c["open"], c["close"]) - c["low"]
-    body_ratio = body / rng
-    close_position = (c["close"] - c["low"]) / rng
-    return rng, body, upper, lower, body_ratio, close_position
-
-# ---------------- TWELVE DATA ----------------
-
-def fetch_candles(symbol, interval, outputsize=120):
     if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("TWELVE_DATA_API_KEY is missing")
+        raise RuntimeError("TWELVE_DATA_API_KEY is not configured")
 
-    key = f"{symbol}|{interval}|{outputsize}"
-    now = time.time()
+    params = dict(params)
+    params["apikey"] = TWELVE_DATA_API_KEY
 
-    # Short cache protects against 429 errors.
-    if key in cache and now - cache[key]["time"] < 45:
-        return cache[key]["data"], True
+    try:
+        response = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    url = "https://api.twelvedata.com/time_series"
+        if response.status_code == 429:
+            raise RuntimeError("Twelve Data rate limit reached (429)")
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("status") == "error":
+            raise RuntimeError(
+                data.get("message", "Twelve Data returned an error")
+            )
+
+        if "values" not in data:
+            raise RuntimeError("No market values returned")
+
+        return data
+
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Market request failed: {exc}") from exc
+
+
+def get_market_data(symbol, interval=MAIN_INTERVAL, outputsize=OUTPUT_SIZE):
+    """
+    Get candles for a symbol.
+    Uses cached data when possible.
+    """
+
+    cache_key = f"{symbol}:{interval}"
+
     params = {
         "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
         "format": "JSON",
-        "order": "ASC",
     }
 
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        data = twelve_data_request(params)
 
-    if data.get("status") == "error":
-        raise RuntimeError(data.get("message", "Twelve Data returned an error"))
+        values = data.get("values", [])
 
-    values = data.get("values")
-    if not values:
-        raise RuntimeError(f"No candle data returned for {symbol} {interval}")
+        if not values:
+            raise RuntimeError("Empty market data")
 
-    candles = []
-    for row in values:
-        o = safe_float(row.get("open"))
-        h = safe_float(row.get("high"))
-        l = safe_float(row.get("low"))
-        c = safe_float(row.get("close"))
-        if None in (o, h, l, c):
-            continue
-        candles.append({
-            "datetime": row.get("datetime", ""),
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-        })
+        df = pd.DataFrame(values)
 
-    if len(candles) < 60:
-        raise RuntimeError(f"Insufficient candles for {symbol} {interval}: {len(candles)}")
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(
+                df["datetime"],
+                errors="coerce",
+            )
 
-    cache[key] = {"time": now, "data": candles}
-    state["api_ok"] = True
-    return candles, False
+        numeric_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
 
-# ---------------- MARKET ANALYSIS ----------------
+        for column in numeric_columns:
+            if column in df.columns:
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce",
+                )
 
-def structure(candles, lookback=12):
-    if len(candles) < lookback + 3:
-        return None
+        df = df.dropna(subset=["close"])
 
-    recent = candles[-lookback:]
-    prior = candles[-(lookback * 2):-lookback]
+        df = df.sort_values("datetime")
 
-    recent_high = max(c["high"] for c in recent)
-    recent_low = min(c["low"] for c in recent)
-    prior_high = max(c["high"] for c in prior) if prior else recent_high
-    prior_low = min(c["low"] for c in prior) if prior else recent_low
+        if len(df) < 30:
+            raise RuntimeError(
+                f"Insufficient candles returned: {len(df)}"
+            )
 
-    return {
-        "recent_high": recent_high,
-        "recent_low": recent_low,
-        "prior_high": prior_high,
-        "prior_low": prior_low,
-        "break_high": recent_high > prior_high,
-        "break_low": recent_low < prior_low,
-    }
+        cached_data[cache_key] = {
+            "data": df.copy(),
+            "timestamp": time.time(),
+        }
 
-def trend_data(candles):
-    closes = [c["close"] for c in candles]
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    r = rsi(closes, 14)
-    a = atr(candles, 14)
+        return df, False
 
-    if e20 is None or e50 is None or r is None or a is None:
-        raise RuntimeError("Unable to calculate indicators")
+    except Exception as exc:
 
-    return {
-        "price": closes[-1],
-        "ema20": e20,
-        "ema50": e50,
-        "rsi": r,
-        "atr": a,
-    }
+        logger.warning(
+            "Market data failed for %s %s: %s",
+            symbol,
+            interval,
+            exc,
+        )
 
-def build_signal(symbol, candles5, candles15, candles1h):
+        cached = cached_data.get(cache_key)
+
+        if cached:
+            age = time.time() - cached["timestamp"]
+
+            logger.warning(
+                "Using cached market data for %s %s "
+                "(age %.0fs)",
+                symbol,
+                interval,
+                age,
+            )
+
+            return cached["data"].copy(), True
+
+        raise
+
+
+# ============================================================
+# SYMBOL DISCOVERY
+# ============================================================
+
+def find_working_symbol(symbols, market_name):
     """
-    Returns the strongest qualifying signal only.
-    No WAIT signals are returned.
+    Try symbols until Twelve Data returns valid data.
+
+    This is the important NAS fallback system.
     """
 
-    if len(candles5) < 60 or len(candles15) < 60 or len(candles1h) < 60:
-        return None
+    previous_symbol = market_status[market_name].get("symbol")
 
-    c5 = candles5[-1]
-    prev5 = candles5[-2]
+    candidates = list(symbols)
 
-    d5 = trend_data(candles5)
-    d15 = trend_data(candles15)
-    d1h = trend_data(candles1h)
+    # Try previously working symbol first.
+    if previous_symbol and previous_symbol in candidates:
+        candidates.remove(previous_symbol)
+        candidates.insert(0, previous_symbol)
 
-    s5 = structure(candles5, 12)
-    s15 = structure(candles15, 12)
+    last_error = None
 
-    rng, body, upper, lower, body_ratio, close_pos = candle_stats(c5)
-    avg_range = mean([candle_stats(c)[0] for c in candles5[-21:-1]])
+    for symbol in candidates:
 
-    if avg_range <= 0:
-        return None
+        try:
 
-    displacement = rng >= avg_range * 1.35 and body_ratio >= 0.60
-    bullish_candle = c5["close"] > c5["open"]
-    bearish_candle = c5["close"] < c5["open"]
+            logger.info(
+                "Testing %s symbol: %s",
+                market_name,
+                symbol,
+            )
 
-    bullish_trend = d15["ema20"] > d15["ema50"] and d1h["ema20"] >= d1h["ema50"]
-    bearish_trend = d15["ema20"] < d15["ema50"] and d1h["ema20"] <= d1h["ema50"]
+            df, cached = get_market_data(
+                symbol,
+                MAIN_INTERVAL,
+                OUTPUT_SIZE,
+            )
 
-    bullish_momentum = 54 <= d5["rsi"] <= 76
-    bearish_momentum = 24 <= d5["rsi"] <= 46
+            if df is None or df.empty:
+                continue
 
-    breakout_up = c5["close"] > s5["prior_high"]
-    breakout_down = c5["close"] < s5["prior_low"]
+            price = float(df["close"].iloc[-1])
 
-    # Previous candle direction helps identify a clean impulse.
-    prev_bull = prev5["close"] > prev5["open"]
-    prev_bear = prev5["close"] < prev5["open"]
+            market_status[market_name] = {
+                "status": "CACHED" if cached else "OK",
+                "symbol": symbol,
+                "price": price,
+                "last_update": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "error": None,
+            }
 
-    # ---------- STRAIGHT BUY ----------
-    straight_buy_score = 0
-    if bullish_trend: straight_buy_score += 3
-    if displacement and bullish_candle and close_pos >= 0.72: straight_buy_score += 2
-    if breakout_up: straight_buy_score += 2
-    if bullish_momentum: straight_buy_score += 1
-    if c5["close"] > d5["ema20"]: straight_buy_score += 1
-    if prev_bull: straight_buy_score += 1
+            logger.info(
+                "%s connected using %s | price %.2f",
+                market_name,
+                symbol,
+                price,
+            )
 
-    # ---------- STRAIGHT SELL ----------
-    straight_sell_score = 0
-    if bearish_trend: straight_sell_score += 3
-    if displacement and bearish_candle and close_pos <= 0.28: straight_sell_score += 2
-    if breakout_down: straight_sell_score += 2
-    if bearish_momentum: straight_sell_score += 1
-    if c5["close"] < d5["ema20"]: straight_sell_score += 1
-    if prev_bear: straight_sell_score += 1
+            return symbol, df
 
-    # ---------- SLINGSHOT ----------
-    # Impulse happened recently, followed by a controlled pullback,
-    # then the latest candle starts continuation.
-    recent = candles5[-6:-1]
-    recent_high = max(x["high"] for x in recent)
-    recent_low = min(x["low"] for x in recent)
+        except Exception as exc:
 
-    pullback_buy = (
-        d15["ema20"] > d15["ema50"]
-        and c5["low"] <= d5["ema20"] * 1.0015
-        and bullish_candle
-        and c5["close"] > prev5["high"]
+            last_error = str(exc)
+
+            logger.warning(
+                "%s symbol failed: %s -> %s",
+                market_name,
+                symbol,
+                exc,
+            )
+
+    market_status[market_name] = {
+        "status": "ERROR",
+        "symbol": previous_symbol,
+        "price": None,
+        "last_update": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "error": last_error or "No supported symbol found",
+    }
+
+    return None, None
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_ema(series, period):
+    return series.ewm(
+        span=period,
+        adjust=False,
+    ).mean()
+
+
+def calculate_rsi(series, period=14):
+
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    rsi = 100 - (
+        100 / (1 + rs)
     )
 
-    pullback_sell = (
-        d15["ema20"] < d15["ema50"]
-        and c5["high"] >= d5["ema20"] * 0.9985
-        and bearish_candle
-        and c5["close"] < prev5["low"]
+    return rsi.fillna(50)
+
+
+def calculate_atr(df, period=14):
+
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    previous_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - previous_close).abs()
+    tr3 = (low - previous_close).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1,
+    ).max(axis=1)
+
+    atr = true_range.ewm(
+        alpha=1 / period,
+        adjust=False,
+    ).mean()
+
+    return atr
+
+
+def add_indicators(df):
+
+    df = df.copy()
+
+    df["ema20"] = calculate_ema(
+        df["close"],
+        20,
     )
 
-    slingshot_buy_score = 0
-    if d15["ema20"] > d15["ema50"]: slingshot_buy_score += 3
-    if pullback_buy: slingshot_buy_score += 3
-    if d5["rsi"] > 52: slingshot_buy_score += 1
-    if c5["close"] > d5["ema20"]: slingshot_buy_score += 1
-    if c5["close"] > recent_high: slingshot_buy_score += 1
+    df["ema50"] = calculate_ema(
+        df["close"],
+        50,
+    )
 
-    slingshot_sell_score = 0
-    if d15["ema20"] < d15["ema50"]: slingshot_sell_score += 3
-    if pullback_sell: slingshot_sell_score += 3
-    if d5["rsi"] < 48: slingshot_sell_score += 1
-    if c5["close"] < d5["ema20"]: slingshot_sell_score += 1
-    if c5["close"] < recent_low: slingshot_sell_score += 1
+    df["rsi"] = calculate_rsi(
+        df["close"],
+        14,
+    )
 
-    candidates = []
+    df["atr"] = calculate_atr(
+        df,
+        14,
+    )
 
-    if straight_buy_score >= STRAIGHT_MIN_SCORE and straight_buy_score > straight_sell_score:
-        candidates.append(("STRAIGHT BUY", straight_buy_score))
+    df["momentum"] = (
+        df["close"] - df["close"].shift(5)
+    )
 
-    if straight_sell_score >= STRAIGHT_MIN_SCORE and straight_sell_score > straight_buy_score:
-        candidates.append(("STRAIGHT SELL", straight_sell_score))
+    return df
 
-    if slingshot_buy_score >= SLINGSHOT_MIN_SCORE and slingshot_buy_score > slingshot_sell_score:
-        candidates.append(("SLINGSHOT BUY", slingshot_buy_score))
 
-    if slingshot_sell_score >= SLINGSHOT_MIN_SCORE and slingshot_sell_score > slingshot_buy_score:
-        candidates.append(("SLINGSHOT SELL", slingshot_sell_score))
+# ============================================================
+# MARKET STRUCTURE
+# ============================================================
 
-    if not candidates:
-        return None
+def market_structure(df):
 
-    setup, score = max(candidates, key=lambda x: x[1])
-    confidence = clamp(72 + score * 3, 0, 98)
+    recent = df.tail(10)
+
+    highest_high = recent["high"].max()
+    lowest_low = recent["low"].min()
+
+    current_close = float(
+        recent["close"].iloc[-1]
+    )
+
+    if current_close > highest_high * 0.999:
+        return "BULLISH"
+
+    if current_close < lowest_low * 1.001:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+def detect_liquidity_sweep(df):
+
+    if len(df) < 6:
+        return "NONE"
+
+    previous = df.iloc[-2]
+    current = df.iloc[-1]
+
+    previous_high = df["high"].iloc[-6:-2].max()
+    previous_low = df["low"].iloc[-6:-2].min()
+
+    if (
+        current["high"] > previous_high
+        and current["close"] < previous_high
+    ):
+        return "BEARISH_SWEEP"
+
+    if (
+        current["low"] < previous_low
+        and current["close"] > previous_low
+    ):
+        return "BULLISH_SWEEP"
+
+    return "NONE"
+
+
+def detect_fvg(df):
+
+    if len(df) < 5:
+        return "NONE"
+
+    c1 = df.iloc[-3]
+    c3 = df.iloc[-1]
+
+    if c1["high"] < c3["low"]:
+        return "BULLISH_FVG"
+
+    if c1["low"] > c3["high"]:
+        return "BEARISH_FVG"
+
+    return "NONE"
+
+
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
+
+def analyze_market(df, symbol):
+
+    df = add_indicators(df)
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    price = float(current["close"])
+
+    ema20 = float(current["ema20"])
+    ema50 = float(current["ema50"])
+
+    rsi = float(current["rsi"])
+    atr = float(current["atr"])
+
+    momentum = float(current["momentum"])
+
+    structure = market_structure(df)
+
+    sweep = detect_liquidity_sweep(df)
+
+    fvg = detect_fvg(df)
+
+    buy_score = 0
+    sell_score = 0
+
+    reasons_buy = []
+    reasons_sell = []
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    if ema20 > ema50:
+
+        buy_score += 2
+        reasons_buy.append("EMA bullish")
+
+    elif ema20 < ema50:
+
+        sell_score += 2
+        reasons_sell.append("EMA bearish")
+
+    # --------------------------------------------------------
+    # PRICE LOCATION
+    # --------------------------------------------------------
+
+    if price > ema20:
+        buy_score += 1
+        reasons_buy.append("Price above EMA20")
+
+    if price < ema20:
+        sell_score += 1
+        reasons_sell.append("Price below EMA20")
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if 52 <= rsi <= 70:
+
+        buy_score += 2
+        reasons_buy.append("RSI bullish")
+
+    elif 30 <= rsi <= 48:
+
+        sell_score += 2
+        reasons_sell.append("RSI bearish")
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    if momentum > 0:
+
+        buy_score += 1
+        reasons_buy.append("Positive momentum")
+
+    elif momentum < 0:
+
+        sell_score += 1
+        reasons_sell.append("Negative momentum")
+
+    # --------------------------------------------------------
+    # STRUCTURE
+    # --------------------------------------------------------
+
+    if structure == "BULLISH":
+
+        buy_score += 2
+        reasons_buy.append("Bullish structure")
+
+    elif structure == "BEARISH":
+
+        sell_score += 2
+        reasons_sell.append("Bearish structure")
+
+    # --------------------------------------------------------
+    # LIQUIDITY SWEEP
+    # --------------------------------------------------------
+
+    if sweep == "BULLISH_SWEEP":
+
+        buy_score += 2
+        reasons_buy.append("Bullish liquidity sweep")
+
+    elif sweep == "BEARISH_SWEEP":
+
+        sell_score += 2
+        reasons_sell.append("Bearish liquidity sweep")
+
+    # --------------------------------------------------------
+    # FVG
+    # --------------------------------------------------------
+
+    if fvg == "BULLISH_FVG":
+
+        buy_score += 1
+        reasons_buy.append("Bullish FVG")
+
+    elif fvg == "BEARISH_FVG":
+
+        sell_score += 1
+        reasons_sell.append("Bearish FVG")
+
+    # --------------------------------------------------------
+    # SIGNAL
+    # --------------------------------------------------------
+
+    if buy_score > sell_score:
+        direction = "BUY"
+        score = buy_score
+        reasons = reasons_buy
+
+    elif sell_score > buy_score:
+        direction = "SELL"
+        score = sell_score
+        reasons = reasons_sell
+
+    else:
+        return {
+            "signal": "NONE",
+            "symbol": symbol,
+            "price": price,
+            "confidence": 0,
+        }
+
+    # Convert score into confidence.
+    confidence = min(
+        98,
+        int(
+            55 + (
+                score / 13
+            ) * 43
+        ),
+    )
 
     if confidence < MIN_CONFIDENCE:
-        return None
 
-    direction_buy = "BUY" in setup
-    entry = c5["close"]
+        return {
+            "signal": "NONE",
+            "symbol": symbol,
+            "price": price,
+            "confidence": confidence,
+            "reason": "Confidence below threshold",
+        }
 
-    # Conservative ATR-based levels.
-    risk = max(d5["atr"] * 1.15, rng * 0.85)
+    # --------------------------------------------------------
+    # RISK MODEL
+    # --------------------------------------------------------
 
-    if direction_buy:
-        structural_sl = min(
-            c5["low"],
-            prev5["low"],
-            s5["recent_low"],
-        )
-        sl = min(structural_sl, entry - risk)
-        risk_distance = max(entry - sl, d5["atr"] * 0.75)
-        sl = entry - risk_distance
+    atr_multiplier = 1.5
+
+    risk = max(
+        atr * atr_multiplier,
+        atr * 1.1,
+    )
+
+    if direction == "BUY":
+
+        entry = price
+
+        stop_loss = entry - risk
+
+        tp1 = entry + risk * 1.0
+        tp2 = entry + risk * 2.0
+
     else:
-        structural_sl = max(
-            c5["high"],
-            prev5["high"],
-            s5["recent_high"],
-        )
-        sl = max(structural_sl, entry + risk)
-        risk_distance = max(sl - entry, d5["atr"] * 0.75)
-        sl = entry + risk_distance
 
-    if direction_buy:
-        tp1 = entry + risk_distance * 1.0
-        tp2 = entry + risk_distance * 2.0
-        tp3 = entry + risk_distance * 3.0
-    else:
-        tp1 = entry - risk_distance * 1.0
-        tp2 = entry - risk_distance * 2.0
-        tp3 = entry - risk_distance * 3.0
+        entry = price
+
+        stop_loss = entry + risk
+
+        tp1 = entry - risk * 1.0
+        tp2 = entry - risk * 2.0
 
     return {
+        "signal": direction,
         "symbol": symbol,
-        "setup": setup,
-        "confidence": round(confidence),
+        "price": price,
         "entry": entry,
-        "sl": sl,
+        "stop_loss": stop_loss,
         "tp1": tp1,
         "tp2": tp2,
-        "tp3": tp3,
-        "rsi": d5["rsi"],
-        "ema20": d15["ema20"],
-        "ema50": d15["ema50"],
-        "atr": d5["atr"],
-        "time": utc_now(),
-        "candle_time": c5["datetime"],
+        "confidence": confidence,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "atr": atr,
+        "structure": structure,
+        "sweep": sweep,
+        "fvg": fvg,
+        "reasons": reasons,
     }
 
-# ---------------- SIGNAL FORMATTING ----------------
 
-def fmt_price(value):
-    if value >= 1000:
-        return f"{value:,.2f}"
-    if value >= 100:
-        return f"{value:,.2f}"
-    return f"{value:.4f}"
+# ============================================================
+# HIGHER TIMEFRAME CONFIRMATION
+# ============================================================
 
-def signal_key(signal):
-    return (
-        signal["symbol"],
-        signal["setup"],
-        signal["candle_time"],
-        round(signal["entry"], 4),
-    )
+def get_htf_bias(symbol):
 
-def format_signal(s):
-    buy = "BUY" in s["setup"]
-    icon = "🟢" if buy else "🔴"
-    setup_icon = "⚡" if "STRAIGHT" in s["setup"] else "🏹"
-
-    return (
-        f"{icon} <b>{s['setup']}</b>\n"
-        f"<b>{s['symbol']}</b>\n\n"
-        f"{setup_icon} <b>CONFIDENCE: {s['confidence']}%</b>\n\n"
-        f"💰 <b>ENTRY:</b> {fmt_price(s['entry'])}\n"
-        f"🛑 <b>STOP LOSS:</b> {fmt_price(s['sl'])}\n\n"
-        f"🎯 <b>TP1:</b> {fmt_price(s['tp1'])}\n"
-        f"🎯 <b>TP2:</b> {fmt_price(s['tp2'])}\n"
-        f"🎯 <b>TP3:</b> {fmt_price(s['tp3'])}\n\n"
-        f"📊 RSI: {s['rsi']:.1f}\n"
-        f"📈 EMA20/50: {fmt_price(s['ema20'])} / {fmt_price(s['ema50'])}\n"
-        f"📐 ATR: {fmt_price(s['atr'])}\n"
-        f"⏱️ Entry: {ENTRY_INTERVAL} | HTF: {MAIN_INTERVAL}\n\n"
-        f"🕐 {s['time']}\n"
-        f"👑 <b>KING OF XAU/NAS</b>\n"
-        f"<i>Signal only — no WAIT messages.</i>"
-    )
-
-# ---------------- TELEGRAM ----------------
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📡 SIGNALS", callback_data="signals"),
-            InlineKeyboardButton("❤️ HEALTH", callback_data="health"),
-        ],
-        [
-            InlineKeyboardButton("🥇 XAUUSD", callback_data="xau"),
-            InlineKeyboardButton("📈 NAS100", callback_data="nas"),
-        ],
-    ])
-
-async def send_text(application, text):
-    if not TELEGRAM_CHAT_ID:
-        return False
     try:
-        await application.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
+
+        df, cached = get_market_data(
+            symbol,
+            HTF_INTERVAL,
+            100,
+        )
+
+        df = add_indicators(df)
+
+        current = df.iloc[-1]
+
+        if current["ema20"] > current["ema50"]:
+            return "BULLISH"
+
+        if current["ema20"] < current["ema50"]:
+            return "BEARISH"
+
+        return "NEUTRAL"
+
+    except Exception as exc:
+
+        logger.warning(
+            "HTF analysis failed for %s: %s",
+            symbol,
+            exc,
+        )
+
+        return "NEUTRAL"
+
+
+# ============================================================
+# PRICE FORMATTING
+# ============================================================
+
+def format_price(price, symbol):
+
+    if price is None:
+        return "N/A"
+
+    if "XAU" in symbol.upper():
+        return f"{price:,.2f}"
+
+    return f"{price:,.2f}"
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+async def safe_send(bot, chat_id, text):
+
+    try:
+
+        await bot.send_message(
+            chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        state["telegram_ok"] = True
-        return True
+
     except Exception as exc:
-        state["telegram_ok"] = False
-        state["last_error"] = f"Telegram send: {exc}"
-        log.exception("Telegram send failed")
+
+        logger.error(
+            "Telegram send failed: %s",
+            exc,
+        )
+
+
+def build_signal_message(signal, market):
+
+    symbol = signal["symbol"]
+
+    direction = signal["signal"]
+
+    emoji = "🟢" if direction == "BUY" else "🔴"
+
+    price = format_price(
+        signal["price"],
+        symbol,
+    )
+
+    entry = format_price(
+        signal["entry"],
+        symbol,
+    )
+
+    sl = format_price(
+        signal["stop_loss"],
+        symbol,
+    )
+
+    tp1 = format_price(
+        signal["tp1"],
+        symbol,
+    )
+
+    tp2 = format_price(
+        signal["tp2"],
+        symbol,
+    )
+
+    reasons = signal.get(
+        "reasons",
+        [],
+    )
+
+    reason_text = "\n".join(
+        f"• {reason}"
+        for reason in reasons[:5]
+    )
+
+    return (
+        f"👑 <b>KING OF XAU/NAS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>{market} {direction}</b>\n\n"
+        f"💰 <b>Price:</b> {price}\n"
+        f"🎯 <b>Entry:</b> {entry}\n"
+        f"🛑 <b>Stop Loss:</b> {sl}\n"
+        f"💎 <b>TP1:</b> {tp1}\n"
+        f"💎 <b>TP2:</b> {tp2}\n\n"
+        f"📊 <b>Confidence:</b> "
+        f"{signal['confidence']}%\n"
+        f"⏱️ <b>Timeframe:</b> {MAIN_INTERVAL}\n\n"
+        f"📈 <b>EMA20:</b> "
+        f"{signal['ema20']:.2f}\n"
+        f"📉 <b>EMA50:</b> "
+        f"{signal['ema50']:.2f}\n"
+        f"📊 <b>RSI:</b> "
+        f"{signal['rsi']:.1f}\n"
+        f"🌊 <b>ATR:</b> "
+        f"{signal['atr']:.2f}\n"
+        f"🏗️ <b>Structure:</b> "
+        f"{signal['structure']}\n\n"
+        f"<b>Confirmation</b>\n"
+        f"{reason_text}\n\n"
+        f"⚠️ <i>Market information is for "
+        f"analysis only. Not financial advice.</i>"
+    )
+
+
+# ============================================================
+# DUPLICATE SIGNAL PROTECTION
+# ============================================================
+
+def signal_key(signal):
+
+    return (
+        signal["symbol"],
+        signal["signal"],
+        round(signal["entry"], 1),
+    )
+
+
+def should_send_signal(market, signal):
+
+    key = signal_key(signal)
+
+    previous = last_signals.get(market)
+
+    if previous == key:
         return False
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["telegram_ok"] = True
-    text = (
-        "👑 <b>KING OF XAU/NAS</b>\n"
-        "<b>PRO SIGNAL TERMINAL</b>\n\n"
-        "🟢 Straight Buy/Sell\n"
-        "🏹 Slingshot Buy/Sell\n"
-        "⚡ Signal-only engine\n"
-        "🛡️ Duplicate protection\n"
-        "🔄 Auto-recovery watchdog\n\n"
-        "The bot stays silent when there is no valid setup.\n\n"
-        "Use /health to check the scanner."
+    last_signals[market] = key
+
+    return True
+
+
+# ============================================================
+# CHAT ID
+# ============================================================
+
+def get_chat_ids():
+
+    raw = os.getenv(
+        "TELEGRAM_CHAT_ID",
+        "",
+    ).strip()
+
+    if not raw:
+        return []
+
+    ids = []
+
+    for item in raw.split(","):
+
+        item = item.strip()
+
+        if not item:
+            continue
+
+        try:
+            ids.append(int(item))
+        except ValueError:
+            logger.warning(
+                "Invalid TELEGRAM_CHAT_ID: %s",
+                item,
+            )
+
+    return ids
+
+
+# ============================================================
+# STATUS MESSAGE
+# ============================================================
+
+def build_status_message():
+
+    xau = market_status["XAUUSD"]
+    nas = market_status["NAS100"]
+
+    xau_status = (
+        "🟢 OK"
+        if xau["status"] in ("OK", "CACHED")
+        else "🔴 ERROR"
     )
+
+    nas_status = (
+        "🟢 OK"
+        if nas["status"] in ("OK", "CACHED")
+        else "🔴 ERROR"
+    )
+
+    return (
+        f"👑 <b>KING OF XAU/NAS — HEALTH</b>\n\n"
+        f"🟢 <b>Scanner:</b> RUNNING\n"
+        f"🟢 <b>Market Data:</b> CONNECTED\n"
+        f"🟢 <b>Telegram:</b> CONNECTED\n\n"
+        f"🟡 <b>XAUUSD:</b> {xau_status}\n"
+        f"   Symbol: {xau.get('symbol') or 'N/A'}\n"
+        f"   Price: {xau.get('price') or 'N/A'}\n\n"
+        f"🔵 <b>NAS100:</b> {nas_status}\n"
+        f"   Symbol: {nas.get('symbol') or 'N/A'}\n"
+        f"   Price: {nas.get('price') or 'N/A'}\n\n"
+        f"⏱️ <b>Last scan:</b> "
+        f"{last_scan_time or 'Not yet'}\n"
+    )
+
+
+# ============================================================
+# COMMANDS
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    text = (
+        "👑 <b>KING OF XAU/NAS</b>\n\n"
+        "Professional market scanner is online.\n\n"
+        "🟡 XAUUSD\n"
+        "🔵 NAS100\n\n"
+        "Commands:\n"
+        "/status — Bot health\n"
+        "/scan — Run a manual scan\n"
+        "/watchlist — Show markets\n"
+        "/help — Show commands"
+    )
+
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(),
     )
 
-async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["telegram_ok"] = True
-    uptime = int(time.time() - state["started_at"])
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
     text = (
-        "❤️ <b>KING OF XAU/NAS — HEALTH</b>\n\n"
-        f"{'🟢' if state['scanner_running'] else '🔴'} Scanner: "
-        f"<b>{'RUNNING' if state['scanner_running'] else 'STOPPED'}</b>\n"
-        f"{'🟢' if state['api_ok'] else '🔴'} Market Data: "
-        f"<b>{'CONNECTED' if state['api_ok'] else 'ERROR'}</b>\n"
-        f"{'🟢' if state['telegram_ok'] else '🔴'} Telegram: "
-        f"<b>{'CONNECTED' if state['telegram_ok'] else 'ERROR'}</b>\n"
-        f"{'🟢' if state['xau_ok'] else '🔴'} XAUUSD: "
-        f"<b>{'OK' if state['xau_ok'] else 'ERROR'}</b>\n"
-        f"{'🟢' if state['nas_ok'] else '🔴'} NAS100: "
-        f"<b>{'OK' if state['nas_ok'] else 'ERROR'}</b>\n\n"
-        f"⏱️ Last scan: {state['last_scan'] or '—'}\n"
-        f"🟢 Last success: {state['last_success'] or '—'}\n"
-        f"📨 Last signal: {state['last_signal'] or '—'}\n"
-        f"⏳ Uptime: {hours}h {minutes}m\n"
+        "👑 <b>KING OF XAU/NAS</b>\n\n"
+        "/start — Start bot\n"
+        "/status — Health status\n"
+        "/scan — Scan markets now\n"
+        "/watchlist — Show markets\n"
+        "/help — Help"
     )
-
-    if state["last_error"]:
-        text += f"\n⚠️ <b>Last error:</b>\n{state['last_error'][:500]}"
 
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(),
     )
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await health_command(update, context)
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-    if query.data == "health":
-        await health_command(update, context)
-    elif query.data == "signals":
-        await query.edit_message_text(
-            "📡 <b>SIGNAL ENGINE ACTIVE</b>\n\n"
-            "The bot sends only qualifying BUY/SELL setups.\n"
-            "No WAIT messages are generated.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
+    await update.message.reply_text(
+        build_status_message(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def watchlist_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        (
+            "👑 <b>WATCHLIST</b>\n\n"
+            "🟡 XAU/USD\n"
+            "🔵 NAS100\n\n"
+            f"⏱️ Main timeframe: "
+            f"{MAIN_INTERVAL}"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# SCANNER
+# ============================================================
+
+async def perform_scan(bot):
+
+    global last_scan_time
+
+    if not scanner_lock.acquire(blocking=False):
+
+        logger.warning(
+            "Scanner already running."
         )
-    elif query.data == "xau":
-        await query.edit_message_text(
-            f"🥇 <b>XAUUSD</b>\n\n"
-            f"Symbol: {XAU_SYMBOL}\n"
-            f"Entry TF: {ENTRY_INTERVAL}\n"
-            f"Mode: STRAIGHT + SLINGSHOT",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
-        )
-    elif query.data == "nas":
-        await query.edit_message_text(
-            f"📈 <b>NAS100</b>\n\n"
-            f"Symbol: {NAS_SYMBOL}\n"
-            f"Entry TF: {ENTRY_INTERVAL}\n"
-            f"Mode: STRAIGHT + SLINGSHOT",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(),
-        )
 
-# ---------------- SCANNER ----------------
-
-async def scan_symbol(application, symbol):
-    # Sequential requests deliberately reduce API pressure.
-    c5, _ = await asyncio.to_thread(fetch_candles, symbol, ENTRY_INTERVAL, 120)
-    c15, _ = await asyncio.to_thread(fetch_candles, symbol, MAIN_INTERVAL, 120)
-    c1h, _ = await asyncio.to_thread(fetch_candles, symbol, HTF_INTERVAL, 120)
-
-    signal = build_signal(symbol, c5, c15, c1h)
-
-    if symbol == XAU_SYMBOL:
-        state["xau_ok"] = True
-    elif symbol == NAS_SYMBOL:
-        state["nas_ok"] = True
-
-    return signal
-
-async def scanner_loop(application):
-    state["scanner_running"] = True
-    log.info("Signal scanner started")
-
-    while True:
-        cycle_ok = False
-
-        try:
-            state["last_scan"] = utc_now()
-
-            # XAU first
-            try:
-                signal = await scan_symbol(application, XAU_SYMBOL)
-                cycle_ok = True
-                if signal:
-                    await process_signal(application, signal)
-            except Exception as exc:
-                state["xau_ok"] = False
-                state["last_error"] = f"XAU: {exc}"
-                log.exception("XAU scan failed")
-
-            # Small gap to reduce rate-limit pressure.
-            await asyncio.sleep(2)
-
-            # NAS second
-            try:
-                signal = await scan_symbol(application, NAS_SYMBOL)
-                cycle_ok = True
-                if signal:
-                    await process_signal(application, signal)
-            except Exception as exc:
-                state["nas_ok"] = False
-                state["last_error"] = f"NAS: {exc}"
-                log.exception("NAS scan failed")
-
-            if cycle_ok:
-                state["last_success"] = utc_now()
-                state["scanner_errors"] = 0
-            else:
-                state["scanner_errors"] += 1
-
-        except asyncio.CancelledError:
-            state["scanner_running"] = False
-            raise
-        except Exception as exc:
-            state["scanner_errors"] += 1
-            state["last_error"] = f"Scanner: {exc}"
-            log.exception("Scanner loop recovered from unexpected error")
-            await asyncio.sleep(10)
-
-        await asyncio.sleep(SCAN_SECONDS)
-
-async def process_signal(application, signal):
-    key = signal_key(signal)
-    now = time.time()
-
-    # Same signal/candle cannot be sent repeatedly.
-    if key in signal_memory and now - signal_memory[key] < SIGNAL_COOLDOWN_SECONDS:
         return
 
-    # Also suppress a duplicate setup on the same symbol within cooldown.
-    simple_key = (signal["symbol"], signal["setup"])
-    if simple_key in signal_memory and now - signal_memory[simple_key] < SIGNAL_COOLDOWN_SECONDS:
-        return
+    try:
 
-    signal_memory[key] = now
-    signal_memory[simple_key] = now
-
-    state["last_signal"] = f"{signal['setup']} {signal['symbol']}"
-    state["last_signal_time"] = now
-
-    log.info("QUALIFYING SIGNAL: %s", state["last_signal"])
-    await send_text(application, format_signal(signal))
-
-# ---------------- WATCHDOG ----------------
-
-async def watchdog_loop(application):
-    """
-    Keeps a lightweight watchdog alive.
-    It does not generate WAIT messages.
-    """
-    while True:
-        try:
-            await asyncio.sleep(HEARTBEAT_SECONDS)
-
-            if not state["scanner_running"]:
-                log.warning("Scanner appears stopped; restarting.")
-                state["scanner_running"] = True
-                asyncio.create_task(scanner_loop(application))
-
-            # Remove old signal-memory entries.
-            cutoff = time.time() - SIGNAL_COOLDOWN_SECONDS * 3
-            old = [k for k, v in signal_memory.items() if v < cutoff]
-            for k in old:
-                signal_memory.pop(k, None)
-
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            log.exception("Watchdog error: %s", exc)
-            await asyncio.sleep(10)
-
-# ---------------- STARTUP ----------------
-
-async def post_init(application):
-    await application.bot.set_my_commands([
-        ("start", "Open signal terminal"),
-        ("health", "Check bot health"),
-        ("status", "Check bot status"),
-    ])
-
-    state["telegram_ok"] = True
-
-    if TELEGRAM_CHAT_ID:
-        await send_text(
-            application,
-            "🟢 <b>KING OF XAU/NAS ONLINE</b>\n\n"
-            "Signal engine: <b>ACTIVE</b>\n"
-            "Mode: <b>STRAIGHT + SLINGSHOT</b>\n"
-            "Notifications: <b>SIGNAL ONLY</b>\n\n"
-            "Use /health anytime to check the scanner."
+        last_scan_time = datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
         )
 
-    asyncio.create_task(scanner_loop(application))
-    asyncio.create_task(watchdog_loop(application))
+        logger.info(
+            "========== MARKET SCAN =========="
+        )
 
-def validate_config():
-    missing = []
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not TWELVE_DATA_API_KEY:
-        missing.append("TWELVE_DATA_API_KEY")
+        chat_ids = get_chat_ids()
 
-    if missing:
-        raise RuntimeError("Missing Render environment variables: " + ", ".join(missing))
+        # ----------------------------------------------------
+        # XAU
+        # ----------------------------------------------------
+
+        try:
+
+            xau_symbol, xau_df = find_working_symbol(
+                XAU_SYMBOLS,
+                "XAUUSD",
+            )
+
+            if xau_symbol and xau_df is not None:
+
+                xau_signal = analyze_market(
+                    xau_df,
+                    xau_symbol,
+                )
+
+                if xau_signal["signal"] != "NONE":
+
+                    htf = get_htf_bias(
+                        xau_symbol
+                    )
+
+                    if (
+                        xau_signal["signal"] == "BUY"
+                        and htf == "BEARISH"
+                    ):
+                        logger.info(
+                            "XAU BUY rejected by HTF."
+                        )
+
+                    elif (
+                        xau_signal["signal"] == "SELL"
+                        and htf == "BULLISH"
+                    ):
+                        logger.info(
+                            "XAU SELL rejected by HTF."
+                        )
+
+                    elif should_send_signal(
+                        "XAUUSD",
+                        xau_signal,
+                    ):
+
+                        message = build_signal_message(
+                            xau_signal,
+                            "XAUUSD",
+                        )
+
+                        for chat_id in chat_ids:
+                            await safe_send(
+                                bot,
+                                chat_id,
+                                message,
+                            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "XAU scan failed: %s",
+                exc,
+            )
+
+            # Important:
+            # XAU failure must NOT stop NAS.
+
+        # ----------------------------------------------------
+        # NAS100
+        # ----------------------------------------------------
+
+        try:
+
+            nas_symbol, nas_df = find_working_symbol(
+                NAS_SYMBOLS,
+                "NAS100",
+            )
+
+            if nas_symbol and nas_df is not None:
+
+                nas_signal = analyze_market(
+                    nas_df,
+                    nas_symbol,
+                )
+
+                if nas_signal["signal"] != "NONE":
+
+                    htf = get_htf_bias(
+                        nas_symbol
+                    )
+
+                    if (
+                        nas_signal["signal"] == "BUY"
+                        and htf == "BEARISH"
+                    ):
+                        logger.info(
+                            "NAS BUY rejected by HTF."
+                        )
+
+                    elif (
+                        nas_signal["signal"] == "SELL"
+                        and htf == "BULLISH"
+                    ):
+                        logger.info(
+                            "NAS SELL rejected by HTF."
+                        )
+
+                    elif should_send_signal(
+                        "NAS100",
+                        nas_signal,
+                    ):
+
+                        message = build_signal_message(
+                            nas_signal,
+                            "NAS100",
+                        )
+
+                        for chat_id in chat_ids:
+                            await safe_send(
+                                bot,
+                                chat_id,
+                                message,
+                            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "NAS100 scan failed: %s",
+                exc,
+            )
+
+        logger.info(
+            "========== SCAN COMPLETE =========="
+        )
+
+    finally:
+
+        scanner_lock.release()
+
+
+async def scheduled_scan(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    try:
+
+        await perform_scan(
+            context.bot
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Scheduled scanner error: %s",
+            exc,
+        )
+
+
+async def scan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "🔎 <b>Scanning XAUUSD + NAS100...</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    await perform_scan(
+        context.bot
+    )
+
+    await update.message.reply_text(
+        "✅ <b>Scan complete.</b>\n\n"
+        "Use /status to check market connectivity.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# START BOT
+# ============================================================
 
 def main():
-    validate_config()
 
-    threading.Thread(target=run_web, daemon=True).start()
+    if not TELEGRAM_BOT_TOKEN:
 
-    log.info("Starting KING OF XAU/NAS...")
-    log.info("XAU_SYMBOL=%s | NAS_SYMBOL=%s", XAU_SYMBOL, NAS_SYMBOL)
-    log.info("ENTRY=%s | MAIN=%s | HTF=%s", ENTRY_INTERVAL, MAIN_INTERVAL, HTF_INTERVAL)
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not configured"
+        )
+
+    if not TWELVE_DATA_API_KEY:
+
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY is not configured"
+        )
+
+    # --------------------------------------------------------
+    # Flask health server
+    # --------------------------------------------------------
+
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True,
+    )
+
+    flask_thread.start()
+
+    logger.info(
+        "Render health server started on port %s",
+        PORT,
+    )
+
+    # --------------------------------------------------------
+    # Telegram application
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("health", health_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CallbackQueryHandler(callback_handler))
-
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
     )
 
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "watchlist",
+            watchlist_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan_command,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Automatic scanner
+    # --------------------------------------------------------
+
+    application.job_queue.run_repeating(
+        scheduled_scan,
+        interval=SCAN_INTERVAL_SECONDS,
+        first=10,
+    )
+
+    logger.info(
+        "======================================"
+    )
+
+    logger.info(
+        "👑 KING OF XAU/NAS STARTING"
+    )
+
+    logger.info(
+        "XAU symbols: %s",
+        XAU_SYMBOLS,
+    )
+
+    logger.info(
+        "NAS fallback symbols: %s",
+        NAS_SYMBOLS,
+    )
+
+    logger.info(
+        "Scan interval: %s seconds",
+        SCAN_INTERVAL_SECONDS,
+    )
+
+    logger.info(
+        "======================================"
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
 if __name__ == "__main__":
+
     main()
