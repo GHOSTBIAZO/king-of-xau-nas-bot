@@ -1,15 +1,12 @@
 import os
 import time
-import asyncio
-import logging
 import threading
+import logging
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask, jsonify
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,119 +15,145 @@ from telegram.ext import (
 )
 
 # ============================================================
-# 👑 KING OF XAU/NAS — XAUUSD SLINGSHOT
-# XAU/USD ONLY
+# KING GOLD SCALPER — TELEGRAM BOT
+# XAU/USD FAST NORMAL SCALPING
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TWELVE_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# ============================================================
-# MARKET CONFIG
-# ============================================================
-
 SYMBOL = "XAU/USD"
 
-MAIN_INTERVAL = "15min"
-HTF_INTERVAL = "1h"
-ENTRY_INTERVAL = "5min"
+# Scan frequency
+SCAN_SECONDS = 60
 
+# Twelve Data settings
 OUTPUT_SIZE = 100
 
-# Scan every 5 minutes
-SCAN_INTERVAL = 300
+# Signal settings
+EMA_FAST = 9
+EMA_MID = 21
+EMA_SLOW = 50
 
-# Minimum signal confidence
-MIN_CONFIDENCE = 82
+RSI_PERIOD = 14
+ATR_PERIOD = 14
 
-# Prevent duplicate signals
-SIGNAL_COOLDOWN = 1800
+# Minimum confidence — deliberately NOT strict
+MIN_CONFIDENCE = 60
 
-# API cache
-CACHE_SECONDS = 45
-
-REQUEST_TIMEOUT = 20
+# Signal cooldown
+SIGNAL_COOLDOWN = 180
 
 # ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO
 )
 
-logger = logging.getLogger("KING_OF_XAU_NAS")
+logger = logging.getLogger("KING_GOLD_SCALPER")
 
 # ============================================================
-# FLASK
+# FLASK HEALTH SERVER
 # ============================================================
 
 app = Flask(__name__)
 
-LAST_SCAN = None
-LAST_SIGNAL = None
-
-HEALTH = {
-    "scanner": "RUNNING",
-    "market_data": "CONNECTED",
-    "telegram": "CONNECTED",
-    "xau": {
-        "status": "UNKNOWN",
-        "symbol": SYMBOL,
-        "price": None,
-    },
-}
-
-# ============================================================
-# CACHE
-# ============================================================
-
-CACHE = {}
-
-LAST_SENT_SIGNAL = None
-LAST_SENT_TIME = 0
-
-STOP_EVENT = threading.Event()
-
-telegram_app = None
-
-
-# ============================================================
-# WEB HEALTH
-# ============================================================
 
 @app.route("/")
 def home():
     return jsonify({
-        "bot": "KING OF XAU/NAS",
-        "mode": "XAUUSD SLINGSHOT",
-        "status": "RUNNING",
-        "health": HEALTH,
-        "last_scan": LAST_SCAN,
-        "last_signal": LAST_SIGNAL,
+        "bot": "KING GOLD SCALPER",
+        "status": "running",
+        "symbol": SYMBOL,
+        "timeframe": "1M / 5M / 15M",
+        "server_time": datetime.now(timezone.utc).isoformat()
     })
 
 
 @app.route("/health")
 def health():
-    return jsonify(HEALTH)
+    return jsonify({
+        "status": "OK",
+        "scanner": "RUNNING",
+        "market": SYMBOL
+    })
 
 
-@app.route("/ping")
-def ping():
-    return "KING OF XAU/NAS ONLINE", 200
-
-
-def run_flask():
+def run_web_server():
     app.run(
         host="0.0.0.0",
         port=PORT,
         debug=False,
-        use_reloader=False,
+        use_reloader=False
+    )
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+subscribers = set()
+
+last_signal_key = None
+last_signal_time = 0
+
+last_scan_time = None
+last_price = None
+
+scanner_running = True
+
+state_lock = threading.Lock()
+
+
+# ============================================================
+# TELEGRAM MESSAGE HELPERS
+# ============================================================
+
+def main_menu():
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 SCALP BUY", callback_data="buy"),
+            InlineKeyboardButton("🔴 SCALP SELL", callback_data="sell"),
+        ],
+        [
+            InlineKeyboardButton("⚡ AUTO SCALPING", callback_data="auto"),
+        ],
+        [
+            InlineKeyboardButton("📊 SCAN NOW", callback_data="scan"),
+            InlineKeyboardButton("❤️ STATUS", callback_data="status"),
+        ],
+        [
+            InlineKeyboardButton("⛔ STOP ALERTS", callback_data="stop"),
+        ]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def welcome_message():
+
+    return (
+        "👑 *KING GOLD SCALPER*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🟡 *XAU/USD FAST SCALPING*\n\n"
+        "⚡ Normal scalping mode\n"
+        "📉 1M entry\n"
+        "📊 5M confirmation\n"
+        "📈 15M trend\n\n"
+        "Indicators:\n"
+        "• EMA 9 / 21 / 50\n"
+        "• RSI 14\n"
+        "• ATR 14\n"
+        "• Momentum\n\n"
+        "🎯 Automatic Entry / SL / TP\n"
+        "🔄 Automatic scanning\n\n"
+        "Select an option below:"
     )
 
 
@@ -138,41 +161,20 @@ def run_flask():
 # TWELVE DATA
 # ============================================================
 
-def get_market_data(symbol, interval):
-    key = f"{symbol}_{interval}"
+def get_candles(interval):
 
-    now = time.time()
-
-    # -----------------------------
-    # CACHE
-    # -----------------------------
-
-    if key in CACHE:
-
-        timestamp, cached_data = CACHE[key]
-
-        if now - timestamp < CACHE_SECONDS:
-
-            logger.info(
-                "Using cached market data: %s %s",
-                symbol,
-                interval,
-            )
-
-            return cached_data
-
-    # -----------------------------
-    # API
-    # -----------------------------
+    if not TWELVE_API_KEY:
+        logger.error("TWELVE_DATA_API_KEY is missing.")
+        return []
 
     url = "https://api.twelvedata.com/time_series"
 
     params = {
-        "symbol": symbol,
+        "symbol": SYMBOL,
         "interval": interval,
         "outputsize": OUTPUT_SIZE,
-        "format": "JSON",
-        "apikey": TWELVE_DATA_API_KEY,
+        "apikey": TWELVE_API_KEY,
+        "format": "JSON"
     }
 
     try:
@@ -180,123 +182,77 @@ def get_market_data(symbol, interval):
         response = requests.get(
             url,
             params=params,
-            timeout=REQUEST_TIMEOUT,
+            timeout=15
         )
 
-        if response.status_code == 429:
-
-            logger.warning(
-                "Twelve Data rate limit reached."
-            )
-
-            return None
-
         if response.status_code != 200:
-
-            logger.warning(
+            logger.error(
                 "Twelve Data HTTP error: %s",
-                response.status_code,
+                response.status_code
             )
-
-            return None
+            return []
 
         data = response.json()
 
         if "values" not in data:
 
-            logger.warning(
+            logger.error(
                 "Twelve Data error: %s",
-                data.get(
-                    "message",
-                    "No candle data returned."
-                ),
+                data.get("message", data)
             )
 
-            return None
+            return []
 
         candles = []
 
-        # Twelve Data normally returns newest first.
-        # Reverse so calculations are chronological.
-        for item in reversed(data["values"]):
+        for row in reversed(data["values"]):
 
             try:
-
                 candles.append({
-                    "datetime": item["datetime"],
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
+                    "datetime": row["datetime"],
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
                 })
 
             except Exception:
                 continue
 
-        if len(candles) < 60:
-
-            logger.warning(
-                "Insufficient candles: %s",
-                len(candles),
-            )
-
-            return None
-
-        CACHE[key] = (
-            now,
-            candles,
-        )
-
         return candles
-
-    except requests.RequestException as e:
-
-        logger.warning(
-            "Market-data request failed: %s",
-            e,
-        )
-
-        return None
 
     except Exception as e:
 
-        logger.exception(
-            "Market-data error: %s",
-            e,
+        logger.error(
+            "Market data error: %s",
+            e
         )
 
-        return None
+        return []
 
 
 # ============================================================
-# EMA
+# INDICATORS
 # ============================================================
 
-def calculate_ema(values, period):
+def ema(values, period):
 
     if len(values) < period:
         return None
 
     multiplier = 2 / (period + 1)
 
-    value = sum(
-        values[:period]
-    ) / period
+    result = sum(values[:period]) / period
 
     for price in values[period:]:
+        result = (
+            (price - result) * multiplier
+        ) + result
 
-        value = (
-            (price - value) * multiplier
-        ) + value
-
-    return value
+    return result
 
 
-# ============================================================
-# RSI
-# ============================================================
-
-def calculate_rsi(values, period=14):
+def rsi(values, period=14):
 
     if len(values) < period + 1:
         return None
@@ -308,34 +264,26 @@ def calculate_rsi(values, period=14):
 
         change = values[i] - values[i - 1]
 
-        if change > 0:
-
+        if change >= 0:
             gains.append(change)
             losses.append(0)
-
         else:
-
             gains.append(0)
             losses.append(abs(change))
 
-    avg_gain = (
-        sum(gains[:period]) / period
-    )
-
-    avg_loss = (
-        sum(losses[:period]) / period
-    )
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
 
         avg_gain = (
-            (avg_gain * (period - 1))
-            + gains[i]
+            (avg_gain * (period - 1)) +
+            gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
-            + losses[i]
+            (avg_loss * (period - 1)) +
+            losses[i]
         ) / period
 
     if avg_loss == 0:
@@ -343,21 +291,15 @@ def calculate_rsi(values, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100 - (
-        100 / (1 + rs)
-    )
+    return 100 - (100 / (1 + rs))
 
 
-# ============================================================
-# ATR
-# ============================================================
-
-def calculate_atr(candles, period=14):
+def atr(candles, period=14):
 
     if len(candles) < period + 1:
         return None
 
-    ranges = []
+    true_ranges = []
 
     for i in range(1, len(candles)):
 
@@ -365,796 +307,404 @@ def calculate_atr(candles, period=14):
         previous = candles[i - 1]
 
         tr = max(
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
         )
 
-        ranges.append(tr)
+        true_ranges.append(tr)
 
-    if len(ranges) < period:
+    if len(true_ranges) < period:
         return None
 
-    return sum(
-        ranges[-period:]
-    ) / period
+    value = sum(true_ranges[:period]) / period
+
+    for tr in true_ranges[period:]:
+        value = (
+            (value * (period - 1)) + tr
+        ) / period
+
+    return value
 
 
 # ============================================================
-# MARKET STRUCTURE
+# ANALYSIS
 # ============================================================
 
-def get_structure(candles):
+def analyze_timeframe(candles):
 
-    if len(candles) < 30:
-        return "NEUTRAL"
-
-    recent = candles[-20:]
-
-    highs = [
-        x["high"]
-        for x in recent
-    ]
-
-    lows = [
-        x["low"]
-        for x in recent
-    ]
-
-    last = candles[-1]
-
-    previous = candles[-2]
-
-    recent_high = max(highs[:-2])
-    recent_low = min(lows[:-2])
-
-    if (
-        last["close"] > recent_high
-        and last["close"] > previous["close"]
-    ):
-        return "BULLISH_BREAK"
-
-    if (
-        last["close"] < recent_low
-        and last["close"] < previous["close"]
-    ):
-        return "BEARISH_BREAK"
-
-    if last["high"] > previous["high"]:
-        return "BULLISH"
-
-    if last["low"] < previous["low"]:
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-# ============================================================
-# LIQUIDITY SWEEP
-# ============================================================
-
-def detect_liquidity_sweep(candles):
-
-    if len(candles) < 10:
-        return "NONE"
-
-    current = candles[-1]
-
-    previous = candles[-6:-1]
-
-    previous_high = max(
-        x["high"]
-        for x in previous
-    )
-
-    previous_low = min(
-        x["low"]
-        for x in previous
-    )
-
-    # Bullish liquidity sweep:
-    # price takes previous low and closes back above it
-    if (
-        current["low"] < previous_low
-        and current["close"] > previous_low
-    ):
-        return "BULLISH_SWEEP"
-
-    # Bearish liquidity sweep:
-    # price takes previous high and closes back below it
-    if (
-        current["high"] > previous_high
-        and current["close"] < previous_high
-    ):
-        return "BEARISH_SWEEP"
-
-    return "NONE"
-
-
-# ============================================================
-# FAIR VALUE GAP
-# ============================================================
-
-def detect_fvg(candles):
-
-    if len(candles) < 5:
-        return "NONE"
-
-    a = candles[-3]
-    c = candles[-1]
-
-    # Bullish FVG
-    if c["low"] > a["high"]:
-        return "BULLISH_FVG"
-
-    # Bearish FVG
-    if c["high"] < a["low"]:
-        return "BEARISH_FVG"
-
-    return "NONE"
-
-
-# ============================================================
-# SLINGSHOT ENGINE
-# ============================================================
-
-def slingshot_signal(candles, htf_candles):
-
-    if (
-        not candles
-        or not htf_candles
-        or len(candles) < 60
-        or len(htf_candles) < 60
-    ):
+    if len(candles) < 60:
         return None
 
     closes = [
-        x["close"]
-        for x in candles
+        c["close"]
+        for c in candles
     ]
 
-    htf_closes = [
-        x["close"]
-        for x in htf_candles
-    ]
+    current = candles[-1]
+    previous = candles[-2]
 
-    price = closes[-1]
+    price = current["close"]
 
-    ema20 = calculate_ema(
+    ema9 = ema(closes, EMA_FAST)
+    ema21 = ema(closes, EMA_MID)
+    ema50 = ema(closes, EMA_SLOW)
+
+    rsi_value = rsi(
         closes,
-        20,
+        RSI_PERIOD
     )
 
-    ema50 = calculate_ema(
-        closes,
-        50,
-    )
-
-    htf_ema20 = calculate_ema(
-        htf_closes,
-        20,
-    )
-
-    htf_ema50 = calculate_ema(
-        htf_closes,
-        50,
-    )
-
-    rsi = calculate_rsi(
-        closes,
-        14,
-    )
-
-    atr = calculate_atr(
+    atr_value = atr(
         candles,
-        14,
+        ATR_PERIOD
     )
 
-    if any(
-        x is None
-        for x in [
-            ema20,
-            ema50,
-            htf_ema20,
-            htf_ema50,
-            rsi,
-            atr,
-        ]
+    if None in (
+        ema9,
+        ema21,
+        ema50,
+        rsi_value,
+        atr_value
     ):
         return None
 
-    structure = get_structure(
-        candles
-    )
+    score_buy = 0
+    score_sell = 0
 
-    sweep = detect_liquidity_sweep(
-        candles
-    )
+    # EMA direction
+    if ema9 > ema21:
+        score_buy += 2
+    elif ema9 < ema21:
+        score_sell += 2
 
-    fvg = detect_fvg(
-        candles
-    )
+    # Price vs EMA50
+    if price > ema50:
+        score_buy += 2
+    elif price < ema50:
+        score_sell += 2
 
-    # ========================================================
-    # SCORE
-    # ========================================================
+    # Candle direction
+    if current["close"] > current["open"]:
+        score_buy += 1
+    elif current["close"] < current["open"]:
+        score_sell += 1
 
-    buy_score = 0
-    sell_score = 0
+    # Momentum
+    if current["close"] > previous["close"]:
+        score_buy += 1
+    elif current["close"] < previous["close"]:
+        score_sell += 1
 
-    # -------------------------
-    # EMA TREND
-    # -------------------------
-
-    if price > ema20:
-        buy_score += 2
-
-    if price < ema20:
-        sell_score += 2
-
-    if ema20 > ema50:
-        buy_score += 2
-
-    if ema20 < ema50:
-        sell_score += 2
-
-    # -------------------------
-    # HTF TREND
-    # -------------------------
-
-    if (
-        htf_ema20 > htf_ema50
-        and price > htf_ema20
-    ):
-        buy_score += 2
-
-    if (
-        htf_ema20 < htf_ema50
-        and price < htf_ema20
-    ):
-        sell_score += 2
-
-    # -------------------------
     # RSI
-    # -------------------------
+    if 52 <= rsi_value <= 70:
+        score_buy += 2
 
-    if 50 <= rsi <= 68:
-        buy_score += 1
+    if 30 <= rsi_value <= 48:
+        score_sell += 2
 
-    if 32 <= rsi <= 50:
-        sell_score += 1
+    # Avoid extreme RSI entries
+    if rsi_value > 75:
+        score_buy -= 1
 
-    # -------------------------
-    # STRUCTURE
-    # -------------------------
+    if rsi_value < 25:
+        score_sell -= 1
 
-    if structure in (
-        "BULLISH",
-        "BULLISH_BREAK",
-    ):
-        buy_score += 1
-
-    if structure in (
-        "BEARISH",
-        "BEARISH_BREAK",
-    ):
-        sell_score += 1
-
-    # -------------------------
-    # LIQUIDITY SWEEP
-    # -------------------------
-
-    if sweep == "BULLISH_SWEEP":
-        buy_score += 2
-
-    if sweep == "BEARISH_SWEEP":
-        sell_score += 2
-
-    # -------------------------
-    # FVG
-    # -------------------------
-
-    if fvg == "BULLISH_FVG":
-        buy_score += 1
-
-    if fvg == "BEARISH_FVG":
-        sell_score += 1
-
-    # ========================================================
-    # SLINGSHOT TRIGGER
-    # ========================================================
-
-    direction = None
-
-    if buy_score > sell_score:
+    if score_buy > score_sell:
         direction = "BUY"
-        score = buy_score
-
-    elif sell_score > buy_score:
+        score = score_buy
+    elif score_sell > score_buy:
         direction = "SELL"
-        score = sell_score
-
+        score = score_sell
     else:
-        return None
-
-    # Need strong alignment
-    if score < 7:
-        return None
-
-    confidence = min(
-        98,
-        70 + (score * 3)
-    )
-
-    if confidence < MIN_CONFIDENCE:
-        return None
-
-    # ========================================================
-    # ENTRY / RISK
-    # ========================================================
-
-    entry = price
-
-    if direction == "BUY":
-
-        sl = entry - (
-            atr * 1.5
-        )
-
-        tp1 = entry + (
-            atr * 1.0
-        )
-
-        tp2 = entry + (
-            atr * 2.0
-        )
-
-        tp3 = entry + (
-            atr * 3.0
-        )
-
-    else:
-
-        sl = entry + (
-            atr * 1.5
-        )
-
-        tp1 = entry - (
-            atr * 1.0
-        )
-
-        tp2 = entry - (
-            atr * 2.0
-        )
-
-        tp3 = entry - (
-            atr * 3.0
-        )
+        direction = "NEUTRAL"
+        score = 0
 
     return {
-        "symbol": SYMBOL,
-        "mode": "SLINGSHOT",
         "direction": direction,
-        "confidence": confidence,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "ema20": ema20,
+        "score": score,
+        "price": price,
+        "ema9": ema9,
+        "ema21": ema21,
         "ema50": ema50,
-        "rsi": rsi,
-        "atr": atr,
-        "structure": structure,
-        "sweep": sweep,
-        "fvg": fvg,
+        "rsi": rsi_value,
+        "atr": atr_value
     }
 
 
 # ============================================================
-# PRICE FORMAT
+# SIGNAL ENGINE
 # ============================================================
 
-def fmt(price):
+def generate_signal():
 
-    if price is None:
-        return "N/A"
+    global last_price
+    global last_scan_time
 
-    return f"{price:,.2f}"
+    candles_1m = get_candles("1min")
+
+    if not candles_1m:
+        return None
+
+    candles_5m = get_candles("5min")
+
+    if not candles_5m:
+        return None
+
+    candles_15m = get_candles("15min")
+
+    if not candles_15m:
+        return None
+
+    analysis_1m = analyze_timeframe(candles_1m)
+    analysis_5m = analyze_timeframe(candles_5m)
+    analysis_15m = analyze_timeframe(candles_15m)
+
+    if not analysis_1m:
+        return None
+
+    if not analysis_5m:
+        return None
+
+    if not analysis_15m:
+        return None
+
+    price = analysis_1m["price"]
+
+    last_price = price
+    last_scan_time = datetime.now(timezone.utc)
+
+    # ========================================================
+    # NORMAL SCALPING LOGIC
+    # ========================================================
+
+    buy_points = 0
+    sell_points = 0
+
+    # 1M is the entry direction
+    if analysis_1m["direction"] == "BUY":
+        buy_points += 4
+
+    elif analysis_1m["direction"] == "SELL":
+        sell_points += 4
+
+    # 5M confirmation
+    if analysis_5m["direction"] == "BUY":
+        buy_points += 3
+
+    elif analysis_5m["direction"] == "SELL":
+        sell_points += 3
+
+    # 15M trend
+    if analysis_15m["direction"] == "BUY":
+        buy_points += 2
+
+    elif analysis_15m["direction"] == "SELL":
+        sell_points += 2
+
+    # ========================================================
+    # ALLOW NORMAL SCALPS EVEN WHEN HIGHER TIMEFRAME
+    # IS NOT PERFECTLY ALIGNED
+    # ========================================================
+
+    if buy_points > sell_points and buy_points >= 5:
+
+        direction = "BUY"
+
+        confidence = min(
+            95,
+            55 + (buy_points * 4)
+        )
+
+    elif sell_points > buy_points and sell_points >= 5:
+
+        direction = "SELL"
+
+        confidence = min(
+            95,
+            55 + (sell_points * 4)
+        )
+
+    else:
+
+        return None
+
+    # ========================================================
+    # SL / TP
+    # ========================================================
+
+    atr_value = analysis_1m["atr"]
+
+    if atr_value <= 0:
+        return None
+
+    # Gold scalping multiplier
+    sl_distance = atr_value * 1.4
+
+    tp1_distance = atr_value * 1.5
+    tp2_distance = atr_value * 2.3
+
+    if direction == "BUY":
+
+        entry = price
+        stop_loss = entry - sl_distance
+        tp1 = entry + tp1_distance
+        tp2 = entry + tp2_distance
+
+    else:
+
+        entry = price
+        stop_loss = entry + sl_distance
+        tp1 = entry - tp1_distance
+        tp2 = entry - tp2_distance
+
+    return {
+        "symbol": SYMBOL,
+        "direction": direction,
+        "confidence": confidence,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr_value,
+        "rsi": analysis_1m["rsi"],
+        "ema9": analysis_1m["ema9"],
+        "ema21": analysis_1m["ema21"],
+        "ema50": analysis_1m["ema50"],
+        "trend_5m": analysis_5m["direction"],
+        "trend_15m": analysis_15m["direction"],
+    }
 
 
 # ============================================================
 # SIGNAL MESSAGE
 # ============================================================
 
-def signal_message(signal):
-
-    if signal["direction"] == "BUY":
-
-        header = "🟢 BUY"
-
-    else:
-
-        header = "🔴 SELL"
-
-    return (
-        "👑 <b>KING OF XAU/NAS</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🏹 <b>SLINGSHOT {header}</b>\n\n"
-
-        f"🟡 <b>XAU/USD</b>\n"
-        f"📊 Confidence: "
-        f"<b>{signal['confidence']}%</b>\n"
-        f"⏱️ Timeframe: <b>15M</b>\n\n"
-
-        f"💰 Entry: "
-        f"<b>{fmt(signal['entry'])}</b>\n"
-        f"🛑 Stop Loss: "
-        f"<b>{fmt(signal['sl'])}</b>\n\n"
-
-        f"🎯 TP1: <b>{fmt(signal['tp1'])}</b>\n"
-        f"🎯 TP2: <b>{fmt(signal['tp2'])}</b>\n"
-        f"🎯 TP3: <b>{fmt(signal['tp3'])}</b>\n\n"
-
-        f"📈 EMA20: {fmt(signal['ema20'])}\n"
-        f"📉 EMA50: {fmt(signal['ema50'])}\n"
-        f"📊 RSI14: {signal['rsi']:.1f}\n"
-        f"📏 ATR14: {fmt(signal['atr'])}\n\n"
-
-        f"🏗 Structure: "
-        f"{signal['structure']}\n"
-        f"💧 Liquidity: "
-        f"{signal['sweep']}\n"
-        f"🧩 FVG: "
-        f"{signal['fvg']}\n\n"
-
-        "⚠️ <i>Market information is for "
-        "analysis only. Not financial advice.</i>"
-    )
-
-
-# ============================================================
-# TELEGRAM MENU
-# ============================================================
-
-def main_menu():
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "🏹 SLINGSHOT",
-                callback_data="slingshot"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🟢 BUY",
-                callback_data="buy"
-            ),
-
-            InlineKeyboardButton(
-                "🔴 SELL",
-                callback_data="sell"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔎 SCAN NOW",
-                callback_data="scan"
-            ),
-
-            InlineKeyboardButton(
-                "❤️ HEALTH",
-                callback_data="health"
-            ),
-        ],
-
-    ]
-
-    return InlineKeyboardMarkup(
-        keyboard
-    )
-
-
-# ============================================================
-# TELEGRAM /START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    text = (
-        "👑 <b>KING OF XAU/NAS</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "🟡 <b>XAU/USD SIGNAL SYSTEM</b>\n\n"
-
-        "🏹 <b>SLINGSHOT</b>\n"
-        "Finds high-confidence Gold setups.\n\n"
-
-        "🟢 <b>BUY</b>\n"
-        "Direct bullish scan.\n\n"
-
-        "🔴 <b>SELL</b>\n"
-        "Direct bearish scan.\n\n"
-
-        "📊 Timeframe: 15M\n"
-        "📈 HTF confirmation: 1H\n\n"
-
-        "Select an option below:"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu(),
-    )
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    text = (
-        "👑 <b>KING OF XAU/NAS — HEALTH</b>\n\n"
-
-        "🟢 Scanner: <b>RUNNING</b>\n"
-        "🟢 Market Data: <b>"
-        f"{HEALTH['market_data']}</b>\n"
-        "🟢 Telegram: <b>CONNECTED</b>\n\n"
-
-        "🟡 XAUUSD: "
-        f"<b>{HEALTH['xau']['status']}</b>\n"
-        f"   Symbol: {SYMBOL}\n"
-        f"   Price: "
-        f"<b>{fmt(HEALTH['xau']['price'])}</b>\n\n"
-
-        f"🏹 Mode: <b>SLINGSHOT</b>\n"
-        f"⏱️ Last scan: "
-        f"{LAST_SCAN or 'Not yet'}"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu(),
-    )
-
-
-# ============================================================
-# RUN XAU ANALYSIS
-# ============================================================
-
-def analyse_xau():
-
-    candles = get_market_data(
-        SYMBOL,
-        MAIN_INTERVAL,
-    )
-
-    if not candles:
-
-        HEALTH["xau"] = {
-            "status": "ERROR",
-            "symbol": SYMBOL,
-            "price": None,
-        }
-
-        return None
-
-    price = candles[-1]["close"]
-
-    HEALTH["xau"] = {
-        "status": "OK",
-        "symbol": SYMBOL,
-        "price": price,
-    }
-
-    htf = get_market_data(
-        SYMBOL,
-        HTF_INTERVAL,
-    )
-
-    if not htf:
-        return None
-
-    return slingshot_signal(
-        candles,
-        htf,
-    )
-
-
-# ============================================================
-# SEND SIGNAL
-# ============================================================
-
-async def send_signal(signal):
-
-    global LAST_SENT_SIGNAL
-    global LAST_SENT_TIME
-    global LAST_SIGNAL
-
-    if not signal:
-        return False
+def format_signal(signal):
 
     direction = signal["direction"]
 
-    signal_key = (
-        f"{SYMBOL}_{direction}"
-    )
+    if direction == "BUY":
+        emoji = "🟢"
+        action = "BUY"
+    else:
+        emoji = "🔴"
+        action = "SELL"
 
-    now = time.time()
+    return (
+        "👑 *KING GOLD SCALPER*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
 
-    # Duplicate protection
-    if (
-        LAST_SENT_SIGNAL == signal_key
-        and now - LAST_SENT_TIME
-        < SIGNAL_COOLDOWN
-    ):
-        logger.info(
-            "Duplicate signal suppressed."
-        )
+        f"{emoji} *SCALP {action} XAU/USD*\n\n"
 
-        return False
+        f"💰 Entry: `{signal['entry']:.2f}`\n"
+        f"🛑 Stop Loss: `{signal['stop_loss']:.2f}`\n"
+        f"🎯 TP1: `{signal['tp1']:.2f}`\n"
+        f"🎯 TP2: `{signal['tp2']:.2f}`\n\n"
 
-    LAST_SENT_SIGNAL = signal_key
-    LAST_SENT_TIME = now
+        f"📊 Confidence: *{signal['confidence']:.0f}%*\n"
+        f"⏱ Entry TF: *1M*\n"
+        f"📊 Confirmation: *5M*\n"
+        f"📈 HTF Trend: *{signal['trend_15m']}*\n\n"
 
-    LAST_SIGNAL = signal
+        f"RSI: `{signal['rsi']:.1f}`\n"
+        f"EMA 9: `{signal['ema9']:.2f}`\n"
+        f"EMA 21: `{signal['ema21']:.2f}`\n"
+        f"EMA 50: `{signal['ema50']:.2f}`\n"
+        f"ATR: `{signal['atr']:.2f}`\n\n"
 
-    text = signal_message(
-        signal
-    )
-
-    if not TELEGRAM_CHAT_ID:
-
-        logger.warning(
-            "TELEGRAM_CHAT_ID not configured."
-        )
-
-        return False
-
-    try:
-
-        await telegram_app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-
-        logger.info(
-            "SIGNAL SENT: %s %s",
-            direction,
-            signal["confidence"],
-        )
-
-        return True
-
-    except Exception as e:
-
-        logger.error(
-            "Signal send error: %s",
-            e,
-        )
-
-        return False
-
-
-# ============================================================
-# AUTOMATIC SCAN
-# ============================================================
-
-async def perform_scan():
-
-    global LAST_SCAN
-
-    LAST_SCAN = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-
-    logger.info(
-        "======================================"
-    )
-
-    logger.info(
-        "🏹 SLINGSHOT XAU/USD SCAN"
-    )
-
-    logger.info(
-        "======================================"
-    )
-
-    signal = analyse_xau()
-
-    if not signal:
-
-        logger.info(
-            "No qualifying Slingshot signal."
-        )
-
-        return
-
-    logger.info(
-        "SLINGSHOT SIGNAL: %s",
-        signal["direction"],
-    )
-
-    logger.info(
-        "Confidence: %s%%",
-        signal["confidence"],
-    )
-
-    logger.info(
-        "Entry: %.2f",
-        signal["entry"],
-    )
-
-    await send_signal(
-        signal
+        "⚡ *FAST NORMAL SCALP*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Trade with appropriate risk."
     )
 
 
 # ============================================================
-# BACKGROUND LOOP
+# TELEGRAM COMMANDS
 # ============================================================
 
-async def scanner_loop():
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    logger.info(
-        "🏹 Slingshot scanner started."
+    chat_id = update.effective_chat.id
+
+    subscribers.add(chat_id)
+
+    await update.message.reply_text(
+        welcome_message(),
+        parse_mode="Markdown",
+        reply_markup=main_menu()
     )
 
-    # Scan immediately
-    await perform_scan()
 
-    while not STOP_EVENT.is_set():
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-        try:
+    chat_id = update.effective_chat.id
 
-            await asyncio.sleep(
-                SCAN_INTERVAL
-            )
+    subscribers.discard(chat_id)
 
-            if STOP_EVENT.is_set():
-                break
+    await update.message.reply_text(
+        "⛔ *Gold scalp alerts stopped.*\n\n"
+        "Use /start whenever you want to receive them again.",
+        parse_mode="Markdown"
+    )
 
-            await perform_scan()
 
-        except asyncio.CancelledError:
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-            break
+    with state_lock:
 
-        except Exception as e:
+        scan = (
+            last_scan_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if last_scan_time
+            else "Not scanned yet"
+        )
 
-            logger.exception(
-                "Scanner error: %s",
-                e,
-            )
+        price = (
+            f"{last_price:.2f}"
+            if last_price
+            else "Unavailable"
+        )
 
-            await asyncio.sleep(
-                30
-            )
+    await update.message.reply_text(
+        "❤️ *KING GOLD SCALPER — STATUS*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🟢 Bot: RUNNING\n"
+        "🟢 Scanner: ACTIVE\n"
+        "🟡 Market: XAU/USD\n"
+        f"💰 Price: `{price}`\n"
+        f"👥 Subscribers: `{len(subscribers)}`\n"
+        f"⏱ Last scan: `{scan}`\n"
+        "⚡ Mode: NORMAL SCALPING",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+
+
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    message = await update.message.reply_text(
+        "🔎 Scanning XAU/USD..."
+    )
+
+    signal = generate_signal()
+
+    if signal:
+
+        await message.edit_text(
+            format_signal(signal),
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    else:
+
+        await message.edit_text(
+            "🟡 *XAU/USD SCAN*\n\n"
+            "No clean scalp direction right now.\n"
+            "The scanner will continue automatically.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
 
 
 # ============================================================
@@ -1163,215 +713,261 @@ async def scanner_loop():
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
     await query.answer()
 
+    chat_id = query.message.chat_id
+
     action = query.data
 
-    # ------------------------------------
-    # HEALTH
-    # ------------------------------------
+    if action == "buy":
 
-    if action == "health":
+        subscribers.add(chat_id)
 
-        text = (
-            "👑 <b>KING OF XAU/NAS — HEALTH</b>\n\n"
-            "🟢 Scanner: <b>RUNNING</b>\n"
-            "🟢 Market Data: <b>"
-            f"{HEALTH['market_data']}</b>\n"
-            "🟢 Telegram: <b>CONNECTED</b>\n\n"
-            "🟡 XAUUSD: "
-            f"<b>{HEALTH['xau']['status']}</b>\n"
-            f"   Price: "
-            f"<b>{fmt(HEALTH['xau']['price'])}</b>\n\n"
-            "🏹 Mode: <b>SLINGSHOT</b>\n"
-            f"⏱️ Last scan: "
-            f"{LAST_SCAN or 'Not yet'}"
+        await query.message.reply_text(
+            "🟢 *Manual BUY scan requested.*\n\n"
+            "Scanning Gold...",
+            parse_mode="Markdown"
         )
 
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
+        signal = generate_signal()
+
+        if signal and signal["direction"] == "BUY":
+
+            await query.message.reply_text(
+                format_signal(signal),
+                parse_mode="Markdown",
+                reply_markup=main_menu()
+            )
+
+        else:
+
+            await query.message.reply_text(
+                "🟡 No BUY setup detected right now.",
+                reply_markup=main_menu()
+            )
+
+    elif action == "sell":
+
+        subscribers.add(chat_id)
+
+        await query.message.reply_text(
+            "🔴 *Manual SELL scan requested.*\n\n"
+            "Scanning Gold...",
+            parse_mode="Markdown"
         )
 
-        return
+        signal = generate_signal()
 
-    # ------------------------------------
-    # SCAN
-    # ------------------------------------
+        if signal and signal["direction"] == "SELL":
 
-    if action == "scan":
+            await query.message.reply_text(
+                format_signal(signal),
+                parse_mode="Markdown",
+                reply_markup=main_menu()
+            )
 
-        await query.edit_message_text(
-            "🔎 <b>Scanning XAU/USD...</b>\n\n"
-            "🏹 Slingshot engine active.",
-            parse_mode=ParseMode.HTML,
+        else:
+
+            await query.message.reply_text(
+                "🟡 No SELL setup detected right now.",
+                reply_markup=main_menu()
+            )
+
+    elif action == "scan":
+
+        subscribers.add(chat_id)
+
+        await query.message.reply_text(
+            "🔎 Scanning XAU/USD..."
         )
 
-        signal = analyse_xau()
+        signal = generate_signal()
 
         if signal:
 
-            await send_signal(
-                signal
-            )
-
             await query.message.reply_text(
-                signal_message(signal),
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
+                format_signal(signal),
+                parse_mode="Markdown",
+                reply_markup=main_menu()
             )
 
         else:
 
             await query.message.reply_text(
-                "🟡 <b>No qualifying signal.</b>\n\n"
-                "The market does not currently "
-                "meet the Slingshot conditions.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
+                "🟡 No qualifying scalp direction right now.",
+                reply_markup=main_menu()
             )
 
-        return
+    elif action == "auto":
 
-    # ------------------------------------
-    # SLINGSHOT
-    # ------------------------------------
+        subscribers.add(chat_id)
 
-    if action == "slingshot":
-
-        await query.edit_message_text(
-            "🏹 <b>SLINGSHOT SCAN</b>\n\n"
-            "Checking XAU/USD for a "
-            "high-confidence setup...",
-            parse_mode=ParseMode.HTML,
+        await query.message.reply_text(
+            "⚡ *AUTO SCALPING ENABLED*\n\n"
+            "You will receive automatic XAU/USD scalp signals.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
         )
 
-        signal = analyse_xau()
+    elif action == "stop":
 
-        if signal:
+        subscribers.discard(chat_id)
 
-            await send_signal(
-                signal
-            )
-
-            await query.message.reply_text(
-                signal_message(signal),
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
-            )
-
-        else:
-
-            await query.message.reply_text(
-                "🏹 <b>SLINGSHOT — NO ENTRY</b>\n\n"
-                "No qualifying BUY or SELL setup "
-                "at the moment.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
-            )
-
-        return
-
-    # ------------------------------------
-    # DIRECT BUY / SELL
-    # ------------------------------------
-
-    if action in (
-        "buy",
-        "sell",
-    ):
-
-        desired_direction = (
-            "BUY"
-            if action == "buy"
-            else "SELL"
+        await query.message.reply_text(
+            "⛔ *AUTO ALERTS STOPPED*",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
         )
 
-        await query.edit_message_text(
-            f"🔎 Checking XAU/USD for "
-            f"<b>{desired_direction}</b>...",
-            parse_mode=ParseMode.HTML,
+    elif action == "status":
+
+        with state_lock:
+
+            scan_time = (
+                last_scan_time.strftime(
+                    "%Y-%m-%d %H:%M:%S UTC"
+                )
+                if last_scan_time
+                else "Not scanned"
+            )
+
+            price = (
+                f"{last_price:.2f}"
+                if last_price
+                else "Unavailable"
+            )
+
+        await query.message.reply_text(
+            "❤️ *KING GOLD SCALPER*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🟢 Bot: RUNNING\n"
+            "🟢 Scanner: ACTIVE\n"
+            "🟡 XAU/USD: CONNECTED\n"
+            f"💰 Price: `{price}`\n"
+            f"👥 Subscribers: `{len(subscribers)}`\n"
+            f"⏱ Last scan: `{scan_time}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
         )
-
-        signal = analyse_xau()
-
-        if (
-            signal
-            and signal["direction"]
-            == desired_direction
-        ):
-
-            await send_signal(
-                signal
-            )
-
-            await query.message.reply_text(
-                signal_message(signal),
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
-            )
-
-        else:
-
-            emoji = (
-                "🟢"
-                if desired_direction == "BUY"
-                else "🔴"
-            )
-
-            await query.message.reply_text(
-                f"{emoji} <b>{desired_direction} "
-                f"NOT CONFIRMED</b>\n\n"
-                "The current XAU/USD conditions "
-                "do not confirm this direction.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
-            )
-
-        return
 
 
 # ============================================================
-# MANUAL COMMAND
+# AUTOMATIC SCANNER
 # ============================================================
 
-async def scan_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def automatic_scanner(application):
 
-    await update.message.reply_text(
-        "🔎 <b>Scanning XAU/USD...</b>\n"
-        "🏹 Slingshot engine active.",
-        parse_mode=ParseMode.HTML,
-    )
+    global last_signal_key
+    global last_signal_time
 
-    signal = analyse_xau()
+    logger.info("Automatic Gold scanner started.")
 
-    if signal:
+    while True:
 
-        await send_signal(
-            signal
-        )
+        try:
 
-        await update.message.reply_text(
-            signal_message(signal),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
-        )
+            if not subscribers:
 
-    else:
+                await __import__("asyncio").sleep(
+                    SCAN_SECONDS
+                )
 
-        await update.message.reply_text(
-            "🟡 <b>No qualifying signal.</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
+                continue
+
+            logger.info(
+                "Scanning XAU/USD..."
+            )
+
+            signal = generate_signal()
+
+            if signal:
+
+                direction = signal["direction"]
+
+                # Round price to avoid duplicate spam
+                price_key = round(
+                    signal["entry"],
+                    1
+                )
+
+                signal_key = (
+                    direction,
+                    price_key
+                )
+
+                current_time = time.time()
+
+                cooldown_ok = (
+                    current_time -
+                    last_signal_time
+                    >= SIGNAL_COOLDOWN
+                )
+
+                new_signal = (
+                    signal_key != last_signal_key
+                )
+
+                if cooldown_ok and new_signal:
+
+                    message = format_signal(
+                        signal
+                    )
+
+                    logger.info(
+                        "NEW SIGNAL: %s %.2f",
+                        direction,
+                        signal["entry"]
+                    )
+
+                    failed_chats = []
+
+                    for chat_id in list(subscribers):
+
+                        try:
+
+                            await application.bot.send_message(
+                                chat_id=chat_id,
+                                text=message,
+                                parse_mode="Markdown",
+                                reply_markup=main_menu()
+                            )
+
+                        except Exception as e:
+
+                            logger.error(
+                                "Telegram send error for %s: %s",
+                                chat_id,
+                                e
+                            )
+
+                            failed_chats.append(chat_id)
+
+                    for chat_id in failed_chats:
+                        subscribers.discard(chat_id)
+
+                    last_signal_key = signal_key
+                    last_signal_time = current_time
+
+            else:
+
+                logger.info(
+                    "No scalp signal."
+                )
+
+        except Exception as e:
+
+            logger.exception(
+                "Scanner error: %s",
+                e
+            )
+
+        await __import__("asyncio").sleep(
+            SCAN_SECONDS
         )
 
 
@@ -1379,113 +975,15 @@ async def scan_command(
 # ERROR HANDLER
 # ============================================================
 
-async def telegram_error(
-    update,
-    context,
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     logger.error(
         "Telegram error: %s",
-        context.error,
+        context.error
     )
-
-
-# ============================================================
-# TELEGRAM MAIN
-# ============================================================
-
-async def telegram_main():
-
-    global telegram_app
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing."
-        )
-
-    if not TWELVE_DATA_API_KEY:
-
-        raise RuntimeError(
-            "TWELVE_DATA_API_KEY is missing."
-        )
-
-    telegram_app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "status",
-            status_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CommandHandler(
-            "scan",
-            scan_command,
-        )
-    )
-
-    telegram_app.add_handler(
-        CallbackQueryHandler(
-            button_handler
-        )
-    )
-
-    telegram_app.add_error_handler(
-        telegram_error
-    )
-
-    HEALTH["telegram"] = "CONNECTED"
-
-    await telegram_app.initialize()
-
-    await telegram_app.start()
-
-    await telegram_app.updater.start_polling(
-        drop_pending_updates=True
-    )
-
-    logger.info(
-        "Telegram polling started."
-    )
-
-    scanner_task = asyncio.create_task(
-        scanner_loop()
-    )
-
-    try:
-
-        while not STOP_EVENT.is_set():
-
-            await asyncio.sleep(1)
-
-    finally:
-
-        scanner_task.cancel()
-
-        try:
-            await scanner_task
-
-        except asyncio.CancelledError:
-            pass
-
-        await telegram_app.updater.stop()
-
-        await telegram_app.stop()
-
-        await telegram_app.shutdown()
 
 
 # ============================================================
@@ -1494,58 +992,107 @@ async def telegram_main():
 
 def main():
 
-    logger.info(
-        "======================================"
-    )
+    if not BOT_TOKEN:
 
-    logger.info(
-        "👑 KING OF XAU/NAS"
-    )
-
-    logger.info(
-        "🏹 XAU/USD SLINGSHOT MODE"
-    )
-
-    logger.info(
-        "======================================"
-    )
-
-    HEALTH["scanner"] = "RUNNING"
-
-    flask_thread = threading.Thread(
-        target=run_flask,
-        daemon=True,
-    )
-
-    flask_thread.start()
-
-    logger.info(
-        "Render health server running on %s",
-        PORT,
-    )
-
-    try:
-
-        asyncio.run(
-            telegram_main()
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN environment variable is missing."
         )
 
-    except KeyboardInterrupt:
+    if not TWELVE_API_KEY:
 
-        logger.info(
-            "Bot stopped."
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY environment variable is missing."
         )
 
-    except Exception as e:
+    # Render health server
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True
+    )
 
-        logger.exception(
-            "Fatal error: %s",
-            e,
+    web_thread.start()
+
+    logger.info(
+        "Health server started on port %s",
+        PORT
+    )
+
+    # Telegram application
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # Commands
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
         )
+    )
 
-    finally:
+    application.add_handler(
+        CommandHandler(
+            "stop",
+            stop
+        )
+    )
 
-        STOP_EVENT.set()
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan
+        )
+    )
+
+    # Buttons
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "===================================="
+    )
+
+    logger.info(
+        "👑 KING GOLD SCALPER"
+    )
+
+    logger.info(
+        "🟡 XAU/USD"
+    )
+
+    logger.info(
+        "⚡ NORMAL SCALPING"
+    )
+
+    logger.info(
+        "📊 1M / 5M / 15M"
+    )
+
+    logger.info(
+        "===================================="
+    )
+
+    # Run polling
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
